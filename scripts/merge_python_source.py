@@ -400,14 +400,27 @@ def merge_files(source_name: str, output_path: Optional[Path] = None) -> str:
         else:
             merged_lines.append("")
     merged_lines.append("")
+    merged_lines.append("")
+    merged_lines.append("    spark.dataSource.register(LakeflowSource)")
+    merged_lines.append("")
 
     merged_content = "\n".join(merged_lines)
 
-    # Write to output file
+    # Check if the file already exists and has the same content
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        f.write(merged_content)
-    print(f"\nMerged file written to: {output_path}", file=sys.stderr)
+    should_write = True
+    
+    if output_path.exists():
+        with open(output_path, "r") as f:
+            existing_content = f.read()
+        if existing_content == merged_content:
+            should_write = False
+            print(f"\nNo changes detected. Skipped writing to: {output_path}", file=sys.stderr)
+    
+    if should_write:
+        with open(output_path, "w") as f:
+            f.write(merged_content)
+        print(f"\nMerged file written to: {output_path}", file=sys.stderr)
 
     return merged_content
 
