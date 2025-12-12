@@ -308,14 +308,14 @@ def register_lakeflow_source(spark):
             lakeflow_connect: LakeflowConnect,
         ):
             self.options = options
-            self.lakeflow_connect = lakeflow_connect
+            self._lakeflow_connect = lakeflow_connect
             self.schema = schema
 
         def initialOffset(self):
             return {}
 
         def read(self, start: dict) -> (Iterator[tuple], dict):
-            records, offset = self.lakeflow_connect.read_table(
+            records, offset = self._lakeflow_connect.read_table(
                 self.options["tableName"], start, self.options
             )
             rows = map(lambda x: parse_value(x, self.schema), records)
@@ -339,7 +339,7 @@ def register_lakeflow_source(spark):
         ):
             self.options = options
             self.schema = schema
-            self.lakeflow_connect = lakeflow_connect
+            self._lakeflow_connect = lakeflow_connect
             self.table_name = options[TABLE_NAME]
 
         def read(self, partition):
@@ -347,7 +347,7 @@ def register_lakeflow_source(spark):
             if self.table_name == METADATA_TABLE:
                 all_records = self._read_table_metadata()
             else:
-                all_records, _ = self.lakeflow_connect.read_table(
+                all_records, _ = self._lakeflow_connect.read_table(
                     self.table_name, None, self.options
                 )
 
@@ -359,7 +359,7 @@ def register_lakeflow_source(spark):
             table_names = [o.strip() for o in table_name_list.split(",") if o.strip()]
             all_records = []
             for table in table_names:
-                metadata = self.lakeflow_connect.read_table_metadata(table, self.options)
+                metadata = self._lakeflow_connect.read_table_metadata(table, self.options)
                 all_records.append({"tableName": table, **metadata})
             return all_records
 
@@ -367,7 +367,13 @@ def register_lakeflow_source(spark):
     class LakeflowSource(DataSource):
         def __init__(self, options):
             self.options = options
-            self.lakeflow_connect = LakeflowConnect(options)
+            self._lakeflow_connect = None
+
+        def _get_lakeflow_connect(self):
+            """Lazy initialization of LakeflowConnect to avoid serialization issues."""
+            if self._lakeflow_connect is None:
+                self._lakeflow_connect = LakeflowConnect(self.options)
+            return self._lakeflow_connect
 
         @classmethod
         def name(cls):
@@ -386,13 +392,13 @@ def register_lakeflow_source(spark):
                 )
             else:
                 # Assuming the LakeflowConnect interface uses get_table_schema, not get_table_details
-                return self.lakeflow_connect.get_table_schema(table, self.options)
+                return self._get_lakeflow_connect().get_table_schema(table, self.options)
 
         def reader(self, schema: StructType):
-            return LakeflowBatchReader(self.options, schema, self.lakeflow_connect)
+            return LakeflowBatchReader(self.options, schema, self._get_lakeflow_connect())
 
         def simpleStreamReader(self, schema: StructType):
-            return LakeflowStreamReader(self.options, schema, self.lakeflow_connect)
+            return LakeflowStreamReader(self.options, schema, self._get_lakeflow_connect())
 
 
     spark.dataSource.register(LakeflowSource)
