@@ -472,11 +472,22 @@ UPDATED_SPEC=$(echo "$CURRENT_SPEC" | jq '.configuration.num_rows = "100"')
 databricks pipelines update "$PIPELINE_ID" --json "$UPDATED_SPEC"
 ```
 
+#### Parallel Table Processing
+
+When using `num_tables` > 1, **DLT automatically processes all tables in parallel**. The sequential loop in `ingest.py` only *defines* the tables - DLT's execution engine handles:
+
+- ✅ **Parallel execution** - All independent tables run concurrently
+- ✅ **Resource allocation** - Compute is distributed across tables
+- ✅ **Automatic scaling** - No explicit parallelism configuration needed
+
+For example, with `num_tables=10`, all 10 tables will be ingested simultaneously (subject to cluster resources).
+
 #### Best Practices
 
-- **Start Small**: The Nullsource connector only has one table, making it ideal for testing
+- **Start Small**: Begin with 1-2 tables to validate the pipeline, then scale up
 - **Use for Testing**: This connector is designed for validating pipeline infrastructure, not production use
 - **No Rate Limits**: Since this is a synthetic source, there are no API rate limits to consider
+- **Parallel Testing**: Use multiple tables (`num_tables` > 1) to test DLT's parallel execution capabilities
 
 #### Troubleshooting
 
