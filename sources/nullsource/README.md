@@ -480,7 +480,21 @@ When using `num_tables` > 1, **DLT automatically processes all tables in paralle
 - ✅ **Resource allocation** - Compute is distributed across tables
 - ✅ **Automatic scaling** - No explicit parallelism configuration needed
 
-For example, with `num_tables=10`, all 10 tables will be ingested simultaneously (subject to cluster resources).
+**What controls the degree of parallelism:**
+
+1. **Cluster Resources**
+   - Number of workers × cores per worker = total parallel slots
+   - Example: 4 workers × 8 cores = 32 concurrent table reads
+   - Serverless mode auto-scales based on workload
+
+2. **DLT Scheduler**
+   - Manages which tables run concurrently
+   - Respects dependencies between tables
+   - Automatically distributes work across available resources
+
+**Within-table parallelism:** The `nullsource` connector currently reads each table sequentially (single-threaded per table). This is sufficient for testing and keeps the implementation simple.
+
+**Example:** With `num_tables=10` on a 4-worker cluster, all 10 tables will be ingested simultaneously (each table read is sequential, but tables run in parallel).
 
 #### Best Practices
 
