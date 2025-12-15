@@ -1,14 +1,7 @@
 import random
 from typing import Dict, List, Iterator
 
-from pydantic import BaseModel, PositiveInt, ConfigDict
 from pyspark.sql.types import StructType, StructField, LongType, StringType
-
-
-class ExampleTableOptions(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    num_rows: PositiveInt
 
 
 # This is an example implementation of the LakeflowConnect class.
@@ -75,8 +68,10 @@ class LakeflowConnect:
         """
         Read data from a table and return an iterator of records along with the next offset.
         """
-        options = ExampleTableOptions(**table_options)
-        num_rows = options.num_rows
+        # Get num_rows from table_options, default to 10
+        num_rows = int(table_options.get("num_rows", 10))
+        if num_rows <= 0:
+            raise ValueError(f"num_rows must be positive, got {num_rows}")
 
         # Call the helper function to get the iterator
         data_iterator = self._read_helper(table_name, start_offset, num_rows=num_rows)
