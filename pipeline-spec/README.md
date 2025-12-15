@@ -172,90 +172,108 @@ ingest(spark, pipeline_spec)
 
 **Run in Databricks:**
 
-**Option 1: Via Databricks CLI (Recommended for automation)**
-**Important:** The SDP file requires several dependencies to run. We upload ONLY these files:
-- `libs/source_loader.py` - Loads the connector registration function
-- `sources/example/_generated_example_python_source.py` - The merged connector code
-- `__init__.py` files - Makes Python packages importable
-
-**Note:** We explicitly upload each file to avoid uploading unnecessary connectors (github, hubspot, stripe, zendesk), test files, and documentation.
+**Option 1: Via Databricks CLI (Create DLT Pipeline)**
 
 ```bash
-# Set user workspace path
+# 1. Upload required files to your workspace
 USER_PATH="/Workspace/Users/$(databricks current-user me --output json | jq -r '.userName')"
-
-# Upload only required files to example_connector directory
 PROJECT_PATH="$USER_PATH/example_connector"
 
-# Create a temporary directory with only the files we need
+# Create temp directory with only required files
 TEMP_DIR=$(mktemp -d)
-mkdir -p "$TEMP_DIR/libs"
-mkdir -p "$TEMP_DIR/sources/example"
-mkdir -p "$TEMP_DIR/pipeline-spec"
-
-# Copy only required files
-cp libs/__init__.py "$TEMP_DIR/libs/"
-cp libs/source_loader.py "$TEMP_DIR/libs/"
+mkdir -p "$TEMP_DIR/libs" "$TEMP_DIR/sources/example" "$TEMP_DIR/pipeline-spec"
+cp libs/__init__.py libs/source_loader.py "$TEMP_DIR/libs/"
 cp sources/__init__.py "$TEMP_DIR/sources/"
-cp sources/example/__init__.py "$TEMP_DIR/sources/example/"
-cp sources/example/_generated_example_python_source.py "$TEMP_DIR/sources/example/"
+cp sources/example/__init__.py sources/example/_generated_example_python_source.py "$TEMP_DIR/sources/example/"
 cp pipeline-spec/example_sdp_pipeline.py "$TEMP_DIR/pipeline-spec/"
 
-# Sync the temporary directory (only contains required files)
+# Sync to workspace
 databricks sync "$TEMP_DIR" "$PROJECT_PATH" --full
-
-# Clean up
 rm -rf "$TEMP_DIR"
 
-# Get the URL to view the uploaded project in Databricks UI
+echo "Files uploaded to: $PROJECT_PATH"
+
+# 2. Create the DLT pipeline
+databricks pipelines create --json '{
+  "name": "example_connector_pipeline",
+  "libraries": [
+    {
+      "file": {
+        "path": "'"$PROJECT_PATH"'/pipeline-spec/example_sdp_pipeline.py"
+      }
+    }
+  ],
+  "target": "example_connector_dev",
+  "development": true,
+  "channel": "PREVIEW",
+  "catalog": "main",
+  "serverless": true,
+  "storage": "'"$PROJECT_PATH"'"
+}'
+
+# 3. Start the pipeline (replace PIPELINE_ID with output from create command)
+# databricks pipelines start PIPELINE_ID
+
+# View pipeline in UI
 WORKSPACE_URL=$(databricks auth env --output json | jq -r '.env.DATABRICKS_HOST')
-echo "View uploaded project at: ${WORKSPACE_URL}#workspace${PROJECT_PATH}/"
-
-# Run immediately with jobs submit (using serverless compute)
-# Serverless: faster startup, no cluster management, pay-per-use
-databricks jobs submit --json "{
-  \"run_name\": \"Example SDP Pipeline Run\",
-  \"tasks\": [{
-    \"task_key\": \"run_pipeline\",
-    \"spark_python_task\": {
-      \"python_file\": \"$PROJECT_PATH/pipeline-spec/example_sdp_pipeline.py\"
-    },
-    \"compute\": {
-      \"spec\": {
-        \"kind\": \"serverless_compute\"
-      }
-    }
-  }]
-}"
-
-# Or create a reusable job
-databricks jobs create --json "{
-  \"name\": \"Example Connector SDP Pipeline\",
-  \"tasks\": [{
-    \"task_key\": \"run_pipeline\",
-    \"spark_python_task\": {
-      \"python_file\": \"$PROJECT_PATH/pipeline-spec/example_sdp_pipeline.py\"
-    },
-    \"compute\": {
-      \"spec\": {
-        \"kind\": \"serverless_compute\"
-      }
-    }
-  }]
-}"
+echo "View pipelines at: ${WORKSPACE_URL}/pipelines"
 ```
 
-**Option 2: Via Notebook**
-1. Upload project files to your workspace (using the command above)
+To update an existing pipeline:
+```bash
+# Get pipeline ID
+PIPELINE_ID=$(databricks pipelines list --output json | jq -r '.statuses[] | select(.name=="example_connector_pipeline") | .pipeline_id')
+
+# Update the pipeline configuration
+databricks pipelines update "$PIPELINE_ID" --json '{
+  "name": "example_connector_pipeline",
+  "libraries": [
+    {
+      "file": {
+        "path": "'"$PROJECT_PATH"'/pipeline-spec/example_sdp_pipeline.py"
+      }
+    }
+  ],
+  "target": "example_connector_dev",
+  "development": true,
+  "channel": "PREVIEW",
+  "catalog": "main",
+  "serverless": true,
+  "storage": "'"$PROJECT_PATH"'"
+}'
+
+# Start the updated pipeline
+databricks pipelines start "$PIPELINE_ID"
+```
+
+**Option 2: Via Databricks CLI (Direct Job Submit)**
+
+```bash
+# Upload files (same as Option 1 above)
+
+# Run immediately with jobs submit (serverless)
+databricks jobs submit --json '{
+  "run_name": "Example SDP Pipeline Run",
+  "tasks": [{
+    "task_key": "run_pipeline",
+    "spark_python_task": {
+      "python_file": "'"$PROJECT_PATH"'/pipeline-spec/example_sdp_pipeline.py"
+    },
+    "compute": {
+      "spec": {
+        "kind": "serverless_compute"
+      }
+    }
+  }]
+}'
+```
+
+**Option 3: Via Notebook**
+1. Upload project files to your workspace (using commands from Option 1)
 2. Create a notebook and run:
    ```python
    %run /Workspace/Users/<your-username>/example_connector/pipeline-spec/example_sdp_pipeline
    ```
-
-**Option 3: Via Jobs UI**
-1. Go to **Workflows** → **Jobs** → **Create Job**
-2. Add a Python task pointing to your uploaded pipeline file
-3. Configure cluster and run
 
 ### What Gets Created
 
