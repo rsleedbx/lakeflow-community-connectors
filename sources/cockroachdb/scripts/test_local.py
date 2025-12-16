@@ -7,11 +7,12 @@ Prerequisites:
     2. ./local_setup.sh start    (includes rangefeed enablement)
 
 Usage:
-    python test_local.py                    # Default: YCSB workload, 120s data generation
+    python test_local.py                    # Default: YCSB workload, 120s data generation, localhost
     python test_local.py --duration 60      # Generate data for 60s
     python test_local.py --no-data          # Skip data generation (tests will timeout)
     python test_local.py --diagnostic       # Run changefeed diagnostic first
     python test_local.py --no-cleanup       # Don't kill existing processes
+    python test_local.py --url "postgresql://user:pass@host:port/db?sslmode=verify-full"  # Use remote CockroachCloud
 
 Features:
     • Fast data generation: Uses CockroachDB built-in YCSB workload (~5,000 ops/sec)
@@ -42,50 +43,119 @@ import time
 import argparse
 import threading
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 # Add parent directories to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from sources.cockroachdb.cockroachdb import LakeflowConnect
 
-
-# Workload configuration mapping
-# Note: Only workloads that work with the default 'ycsb' database are included
-# See learnings/WORKLOAD_TESTING_SUMMARY.md for full workload testing details
-WORKLOAD_CONFIG = {
-    "ycsb": {
-        "name": "YCSB",
-        "init_cmd": "cockroach workload init ycsb --drop 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "run_cmd": "cockroach workload run ycsb --duration={duration}s 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "default_table": "usertable",
-        "tables": ["usertable"],
-        "ops_per_sec": "~5,000",
-    },
-    "tpcc": {
-        "name": "TPC-C",
-        "init_cmd": "cockroach workload init tpcc --drop --warehouses=1 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "run_cmd": "cockroach workload run tpcc --duration={duration}s --warehouses=1 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "default_table": "warehouse",
-        "tables": ["warehouse", "district", "customer", "orders", "new_order", "order_line", "stock", "item", "history"],
-        "ops_per_sec": "~1,000",
-    },
-    "kv": {
-        "name": "Key-Value",
-        "init_cmd": "cockroach workload init kv --drop 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "run_cmd": "cockroach workload run kv --duration={duration}s 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "default_table": "kv",
-        "tables": ["kv"],
-        "ops_per_sec": "~10,000",
-    },
-    "movr": {
-        "name": "MovR (Multi-region)",
-        "init_cmd": "cockroach workload init movr --drop 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "run_cmd": "cockroach workload run movr --duration={duration}s 'postgresql://root@localhost:26257/ycsb?sslmode=disable'",
-        "default_table": "users",
-        "tables": ["users", "vehicles", "rides", "promo_codes", "user_promo_codes", "vehicle_location_histories"],
-        "ops_per_sec": "~2,000",
-    },
+# Global connection parameters (can be overridden with --url)
+CONNECTION_PARAMS = {
+    "host": "localhost",
+    "port": "26257",
+    "database": "ycsb",
+    "user": "root",
+    "password": "",
+    "sslmode": "disable"
 }
+
+
+def parse_postgres_url(url):
+    """
+    Parse PostgreSQL connection URL into connection parameters.
+    
+    Example URL:
+        postgresql://user:password@host:port/database?sslmode=require
+    
+    Returns:
+        dict: Connection parameters (host, port, database, user, password, sslmode)
+    """
+    parsed = urlparse(url)
+    
+    # Extract query parameters (e.g., sslmode)
+    query_params = parse_qs(parsed.query)
+    
+    params = {
+        "host": parsed.hostname or "localhost",
+        "port": str(parsed.port) if parsed.port else "26257",
+        "database": parsed.path.lstrip("/") if parsed.path else "defaultdb",
+        "user": parsed.username or "root",
+        "password": parsed.password or "",
+        "sslmode": query_params.get("sslmode", ["disable"])[0]
+    }
+    
+    return params
+
+
+def build_connection_url(database=None):
+    """
+    Build a PostgreSQL connection URL from current CONNECTION_PARAMS.
+    
+    Args:
+        database: Optional database name to override CONNECTION_PARAMS["database"]
+    
+    Returns:
+        str: PostgreSQL connection URL
+    """
+    db = database or CONNECTION_PARAMS["database"]
+    user = CONNECTION_PARAMS["user"]
+    password = CONNECTION_PARAMS["password"]
+    host = CONNECTION_PARAMS["host"]
+    port = CONNECTION_PARAMS["port"]
+    sslmode = CONNECTION_PARAMS["sslmode"]
+    
+    # Build auth part
+    auth = user
+    if password:
+        auth = f"{user}:{password}"
+    
+    return f"postgresql://{auth}@{host}:{port}/{db}?sslmode={sslmode}"
+
+
+def get_workload_config():
+    """
+    Get workload configuration with dynamic connection URLs.
+    
+    Note: Only workloads that work with the default 'ycsb' database are included.
+    See learnings/WORKLOAD_TESTING_SUMMARY.md for full workload testing details.
+    """
+    conn_url = build_connection_url()
+    
+    return {
+        "ycsb": {
+            "name": "YCSB",
+            "init_cmd": f"cockroach workload init ycsb --drop '{conn_url}'",
+            "run_cmd": f"cockroach workload run ycsb --duration={{duration}}s '{conn_url}'",
+            "default_table": "usertable",
+            "tables": ["usertable"],
+            "ops_per_sec": "~5,000",
+        },
+        "tpcc": {
+            "name": "TPC-C",
+            "init_cmd": f"cockroach workload init tpcc --drop --warehouses=1 '{conn_url}'",
+            "run_cmd": f"cockroach workload run tpcc --duration={{duration}}s --warehouses=1 '{conn_url}'",
+            "default_table": "warehouse",
+            "tables": ["warehouse", "district", "customer", "orders", "new_order", "order_line", "stock", "item", "history"],
+            "ops_per_sec": "~1,000",
+        },
+        "kv": {
+            "name": "Key-Value",
+            "init_cmd": f"cockroach workload init kv --drop '{conn_url}'",
+            "run_cmd": f"cockroach workload run kv --duration={{duration}}s '{conn_url}'",
+            "default_table": "kv",
+            "tables": ["kv"],
+            "ops_per_sec": "~10,000",
+        },
+        "movr": {
+            "name": "MovR (Multi-region)",
+            "init_cmd": f"cockroach workload init movr --drop '{conn_url}'",
+            "run_cmd": f"cockroach workload run movr --duration={{duration}}s '{conn_url}'",
+            "default_table": "users",
+            "tables": ["users", "vehicles", "rides", "promo_codes", "user_promo_codes", "vehicle_location_histories"],
+            "ops_per_sec": "~2,000",
+        },
+    }
 
 
 def check_rangefeeds_enabled():
@@ -95,12 +165,12 @@ def check_rangefeeds_enabled():
     try:
         import psycopg2
         conn = psycopg2.connect(
-            host="localhost",
-            port=26257,
-            database="ycsb",
-            user="root",
-            password="",
-            sslmode="disable"
+            host=CONNECTION_PARAMS["host"],
+            port=int(CONNECTION_PARAMS["port"]),
+            database=CONNECTION_PARAMS["database"],
+            user=CONNECTION_PARAMS["user"],
+            password=CONNECTION_PARAMS["password"],
+            sslmode=CONNECTION_PARAMS["sslmode"]
         )
         cur = conn.cursor()
         cur.execute("SHOW CLUSTER SETTING kv.rangefeed.enabled;")
@@ -128,15 +198,13 @@ def check_rangefeeds_enabled():
 
 def test_connection():
     """Test basic connection to CockroachDB."""
-    print("🔌 Testing connection to local CockroachDB...")
+    conn_type = "CockroachCloud" if CONNECTION_PARAMS["host"] != "localhost" else "local CockroachDB"
+    print(f"🔌 Testing connection to {conn_type}...")
+    print(f"   Host: {CONNECTION_PARAMS['host']}:{CONNECTION_PARAMS['port']}")
+    print(f"   Database: {CONNECTION_PARAMS['database']}")
     
     options = {
-        "host": "localhost",
-        "port": "26257",
-        "database": "ycsb",
-        "user": "root",
-        "password": "",
-        "sslmode": "disable",
+        **CONNECTION_PARAMS,
         "schema": "public"
     }
     
@@ -333,12 +401,12 @@ def test_changefeed_with_updates(connector, table_name="events"):
         # First, insert a test record
         import psycopg2
         conn = psycopg2.connect(
-            host="localhost",
-            port=26257,
-            database="ycsb",
-            user="root",
-            password="",
-            sslmode="disable"
+            host=CONNECTION_PARAMS["host"],
+            port=int(CONNECTION_PARAMS["port"]),
+            database=CONNECTION_PARAMS["database"],
+            user=CONNECTION_PARAMS["user"],
+            password=CONNECTION_PARAMS["password"],
+            sslmode=CONNECTION_PARAMS["sslmode"]
         )
         conn.set_session(autocommit=True)
         
@@ -467,7 +535,8 @@ def run_all_tests(preferred_table=None, workload="ycsb"):
     
     # Test 3: Schema for main table
     # Select table based on priority: CLI arg > workload default > first available
-    workload_cfg = WORKLOAD_CONFIG.get(workload, WORKLOAD_CONFIG["ycsb"])
+    workload_config = get_workload_config()
+    workload_cfg = workload_config.get(workload, workload_config["ycsb"])
     workload_default_table = workload_cfg["default_table"]
     
     if preferred_table:
@@ -528,7 +597,8 @@ def start_data_generator(duration, workload="ycsb"):
     Returns:
         subprocess.Popen object or None if failed
     """
-    workload_cfg = WORKLOAD_CONFIG.get(workload, WORKLOAD_CONFIG["ycsb"])
+    workload_config = get_workload_config()
+    workload_cfg = workload_config.get(workload, workload_config["ycsb"])
     
     print(f"\n🚀 Starting CockroachDB {workload_cfg['name']} workload for {duration} seconds...")
     print(f"   (Generates {workload_cfg['ops_per_sec']} ops/sec)")
@@ -738,8 +808,29 @@ Requirements:
         default="ycsb",
         help="CockroachDB workload type (default: ycsb). Also sets default test table."
     )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="PostgreSQL connection URL (e.g., postgresql://user:pass@host:port/db?sslmode=disable). Overrides default localhost settings."
+    )
     
     args = parser.parse_args()
+    
+    # Parse and update connection parameters if --url provided
+    if args.url:
+        try:
+            parsed_params = parse_postgres_url(args.url)
+            CONNECTION_PARAMS.update(parsed_params)
+            print(f"🔗 Using connection URL:")
+            print(f"   Host: {CONNECTION_PARAMS['host']}:{CONNECTION_PARAMS['port']}")
+            print(f"   Database: {CONNECTION_PARAMS['database']}")
+            print(f"   User: {CONNECTION_PARAMS['user']}")
+            print(f"   SSL Mode: {CONNECTION_PARAMS['sslmode']}")
+            print()
+        except Exception as e:
+            print(f"❌ Failed to parse connection URL: {e}")
+            sys.exit(1)
     
     data_generator_process = None
     
