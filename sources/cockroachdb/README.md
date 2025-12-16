@@ -99,6 +99,29 @@ python scripts/test_local.py --no-cleanup
 - ⚡ **One command**: Everything needed for end-to-end testing
 - 📦 **Simple**: No bash scripts needed - just Python and CockroachDB CLI
 
+## Remote CockroachCloud Testing
+
+Test the connector against **remote CockroachDB clusters** using the `--url` parameter:
+
+```bash
+python scripts/test_local.py \
+  --url "postgresql://user:password@battle-walrus-11108.jxf.gcp-us-east1.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full" \
+  --no-data
+```
+
+**Benefits:**
+- ✅ Test against production-like environments
+- ✅ Validate SSL/TLS configurations
+- ✅ Debug issues on specific clusters
+- ✅ Verify rangefeeds on remote clusters
+
+**📖 See [learnings/REMOTE_TESTING.md](learnings/REMOTE_TESTING.md) for:**
+- Full connection URL format and examples
+- SSL mode configuration (verify-full, require, disable)
+- Security best practices
+- Troubleshooting guide
+- Limitations and workarounds
+
 ## Testing Options
 
 This connector provides two testing approaches:
@@ -780,10 +803,10 @@ USER="your_username"
 PASSWORD="your_password"
 
 # Create the connection
-databricks connections create \
-  --name "$CONNECTION_NAME" \
-  --connection-type "lakeflow" \
-  --options '{
+databricks connections create --json '{
+  "name": "'"$CONNECTION_NAME"'",
+  "connection_type": "GENERIC_LAKEFLOW_CONNECT",
+  "options": {
     "host": "'"$HOST"'",
     "port": "'"$PORT"'",
     "database": "'"$DATABASE"'",
@@ -792,7 +815,8 @@ databricks connections create \
     "sslmode": "require",
     "schema": "public",
     "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size"
-  }'
+  }
+}'
 ```
 
 ## Supported Objects

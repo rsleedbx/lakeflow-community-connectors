@@ -33,6 +33,14 @@ This directory contains technical documentation, bug fixes, testing insights, an
 
 ### Testing & Development
 
+- **[REMOTE_TESTING.md](REMOTE_TESTING.md)**  
+  Complete guide for testing against remote CockroachCloud clusters:
+  - Using `--url` parameter with PostgreSQL connection URLs
+  - SSL/TLS configuration (verify-full, require, disable)
+  - Security best practices for password handling
+  - Limitations and workarounds for remote testing
+  - Troubleshooting connection issues
+
 - **[TEST_REPORT_CDC.md](TEST_REPORT_CDC.md)**  
   Comprehensive CDC testing report including:
   - Test results for snapshot and streaming modes
