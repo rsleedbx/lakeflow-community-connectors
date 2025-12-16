@@ -1,0 +1,10 @@
+{
+  "host": "free-tier.gcp-us-central1.cockroachlabs.cloud",
+  "port": "26257",
+  "database": "defaultdb",
+  "user": "your_username",
+  "password": "your_password",
+  "sslmode": "require",
+  "schema": "public"
+}
+

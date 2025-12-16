@@ -1,0 +1,15 @@
+# CockroachDB Connector Requirements
+# Python dependencies for the Lakeflow CockroachDB community connector
+
+# PostgreSQL driver (CockroachDB uses PostgreSQL wire protocol)
+# psycopg2-binary is recommended for easier installation (includes C dependencies)
+psycopg2-binary>=2.9.0
+
+# Apache Spark for data types and processing
+# Note: In production/Databricks, PySpark is already provided
+pyspark>=3.3.0
+
+# Optional: For development and testing
+# pytest>=7.0.0  # For running tests
+# pytest-cov>=4.0.0  # For test coverage
+
