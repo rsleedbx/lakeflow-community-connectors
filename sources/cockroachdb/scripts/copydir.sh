@@ -73,7 +73,7 @@ databricks sync "$TEMP_DIR" "$PROJECT_PATH"
 echo ""
 echo "Cleaning up temp directory..."
 rm -rf "$TEMP_DIR"
-unset "$TEMP_DIR"
+unset TEMP_DIR
 
 echo ""
 echo "✅ Deployment complete!"
