@@ -35,17 +35,47 @@ from libs.source_loader import get_register_function
 
 source_name = "cockroachdb"
 
+print("=" * 80)
+print("🔍 DEBUG: CockroachDB Ingest Pipeline Starting")
+print("=" * 80)
+
+# Debug: Print all DLT configuration for troubleshooting
+print("\n📋 All DLT Configuration Keys:")
+try:
+    # spark.conf.getAll() can return either a list of tuples or a dict depending on Spark version
+    all_conf = spark.conf.getAll()
+    
+    # Convert to dict if it's a list of tuples
+    if isinstance(all_conf, list):
+        conf_dict = dict(all_conf)
+    else:
+        conf_dict = all_conf
+    
+    # Filter for DLT configuration keys
+    dlt_conf = {k: v for k, v in conf_dict.items() if "databricks.pipeline.configuration" in k}
+    
+    if dlt_conf:
+        for key, val in dlt_conf.items():
+            print(f"  {key}: {val}")
+    else:
+        print("  ⚠️  No DLT configuration keys found!")
+        print(f"  Total spark.conf keys: {len(conf_dict)}")
+        # Print a few keys for debugging
+        print("  Sample keys:")
+        for i, key in enumerate(list(conf_dict.keys())[:5]):
+            print(f"    {key}")
+except Exception as e:
+    print(f"  ❌ Error reading spark configuration: {e}")
+
 # Read configuration from DLT pipeline configuration (via Spark config)
 # DLT exposes pipeline configuration with the prefix: spark.databricks.pipeline.configuration.
+print("\n📖 Reading Pipeline Configuration:")
 connection_name = spark.conf.get("spark.databricks.pipeline.configuration.connection_name", "cockroachdb_connection")
 table_list_str = spark.conf.get("spark.databricks.pipeline.configuration.table_list", "")  # Required: comma-separated list
 
-print(f"DLT pipeline configuration - connection_name: {connection_name}, table_list: {table_list_str or 'NOT SET'}")
-
-# Debug: Print all DLT configuration for troubleshooting
-print("All DLT configuration keys:")
-for key in [k for k in spark.conf.getAll() if "databricks.pipeline.configuration" in k[0]]:
-    print(f"  {key[0]}: {key[1]}")
+print(f"  ✓ connection_name: '{connection_name}'")
+print(f"  ✓ table_list: '{table_list_str or 'NOT SET'}'")
+print(f"  ✓ source_name: '{source_name}'")
 
 # Validate and parse table list
 if not table_list_str:
@@ -103,8 +133,16 @@ pipeline_spec = {
     ]
 }
 
-print(f"Pipeline spec generated for {len(pipeline_spec['objects'])} tables")
-print(f"Tables to ingest: {', '.join(all_tables)}")
+print(f"\n✅ Pipeline spec generated for {len(pipeline_spec['objects'])} tables")
+print(f"   Tables to ingest: {', '.join(all_tables)}")
+print(f"\n🔗 Connection Details:")
+print(f"   Connection name: {connection_name}")
+print(f"   This connection will be resolved by Databricks from Unity Catalog")
+print(f"   Expected to have: host, port, database, user, password, sslmode")
+
+print("\n" + "=" * 80)
+print("🚀 Starting Ingestion Pipeline...")
+print("=" * 80 + "\n")
 
 # Run the ingestion pipeline
 ingest(spark, pipeline_spec)
