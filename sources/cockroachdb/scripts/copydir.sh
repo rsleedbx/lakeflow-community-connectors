@@ -79,10 +79,10 @@ echo ""
 echo "✅ Deployment complete!"
 echo ""
 echo "📁 Workspace location:"
-echo "   $WORKSPACE_URL$PROJECT_PATH"
+echo "   $PROJECT_PATH"
 echo ""
 echo "🔗 View files in browser:"
-echo "   $WORKSPACE_URL/workspace$PROJECT_PATH"
+echo "   $WORKSPACE_URL/#workspace$PROJECT_PATH"
 echo ""
 
 set +e
