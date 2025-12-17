@@ -90,40 +90,47 @@ except Exception as e:
 # This matches the pattern used by nullsource connector
 print("\n📖 Reading Pipeline Configuration:")
 
-connection_name = spark.conf.get("connection_name", "cockroachdb_connection")
-table_list_str = spark.conf.get("table_list", "")
+connection_name = spark.conf.get("connection_name", None)
+table_list_str = spark.conf.get("table_list", None)
 
-print(f"  ✓ connection_name: '{connection_name}'")
-print(f"  ✓ table_list: '{table_list_str or 'NOT SET'}'")
-print(f"  ✓ source_name: '{source_name}'")
+if not connection_name:
+    raise ValueError(
+        "connection_name is required but not set in pipeline configuration.\n"
+        "\n"
+        "Please set connection_name in your DLT pipeline configuration.\n"
+        "Example: {\"connection_name\": \"robert_lee_battle-walrus-11108\", \"table_list\": \"usertable\"}\n"
+        "\n"
+        "Check your pipeline settings to ensure configuration is properly set."
+    )
 
-# Validate and parse table list
 if not table_list_str:
     raise ValueError(
         "table_list is required but not set in pipeline configuration.\n"
         "\n"
-        "Please specify tables to ingest as a comma-separated list.\n"
-        "Example: table_list='customers,orders,products'\n"
+        "Please set table_list in your DLT pipeline configuration.\n"
+        "Example: {\"connection_name\": \"my_connection\", \"table_list\": \"usertable\"}\n"
         "\n"
         "To discover available tables, connect to your CockroachDB cluster and run:\n"
-        "  SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';\n"
-        "\n"
-        "Why is this required?\n"
-        "  Community Connectors cannot dynamically discover tables because connection\n"
-        "  credentials are only available during Spark execution, after the pipeline\n"
-        "  spec has already been defined."
+        "  SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"
     )
 
+print(f"  ✓ connection_name: '{connection_name}'")
+print(f"  ✓ table_list: '{table_list_str}'")
+print(f"  ✓ source_name: '{source_name}'")
+
 # Parse table list
+print(f"\n🔄 Parsing table list...")
 all_tables = [t.strip() for t in table_list_str.split(",") if t.strip()]
 
 if not all_tables:
     raise ValueError(
-        "table_list is empty after parsing. Please specify at least one table.\n"
-        "Example: table_list='customers,orders'"
+        "table_list is empty after parsing (possibly only whitespace/commas).\n"
+        "\n"
+        "Please specify at least one valid table name.\n"
+        "Example: table_list='usertable' or table_list='customers,orders'"
     )
 
-print(f"Tables to ingest ({len(all_tables)}): {all_tables}")
+print(f"  ✓ Parsed {len(all_tables)} table(s): {all_tables}")
 
 # Register the source
 register_lakeflow_source = get_register_function(source_name)
