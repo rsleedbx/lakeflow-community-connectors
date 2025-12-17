@@ -1,15 +1,31 @@
 #!/bin/bash
 # Create DLT pipeline for CockroachDB connector
-# Usage: ./createpipeline.sh [connection_name] [table_list]
+# Usage: ./createpipeline.sh <connection_name> [table_list]
 #
 # Examples:
-#   ./createpipeline.sh                                    # Use default connection "cockroachdb_connection" and all tables
-#   ./createpipeline.sh my_crdb_connection                 # Use custom connection name
-#   ./createpipeline.sh cockroachdb_connection customers   # Use specific table
+#   ./createpipeline.sh cockroachdb_connection                     # All tables (dynamic discovery)
+#   ./createpipeline.sh cockroachdb_connection "customers,orders"  # Specific tables
+#
+# Note: table_list is OPTIONAL
+#   - If not provided: All tables will be discovered via list_tables()
+#   - If provided: Only specified tables will be ingested
 
 SOURCE_NAME="cockroachdb"
-CONNECTION_NAME="${1:-cockroachdb_connection}"  # Default to cockroachdb_connection
+CONNECTION_NAME="${1:-}"
 TABLE_LIST="${2:-}"  # Optional: specific tables to ingest
+
+# Validate required arguments
+if [ -z "$CONNECTION_NAME" ]; then
+  echo "❌ Error: connection_name is required"
+  echo ""
+  echo "Usage: $0 <connection_name> [table_list]"
+  echo ""
+  echo "Examples:"
+  echo "  $0 cockroachdb_connection                      # Ingest all tables"
+  echo "  $0 cockroachdb_connection \"customers,orders\"   # Ingest specific tables"
+  echo ""
+  exit 1
+fi
 
 # Get current username and workspace URL
 USER_NAME=$(databricks current-user me --output json | jq -r '.userName')
@@ -28,9 +44,9 @@ echo "User: $USER_NAME"
 echo "Connection: $CONNECTION_NAME"
 echo "Pipeline name: $PIPELINE_NAME"
 if [ -n "$TABLE_LIST" ]; then
-  echo "Tables: $TABLE_LIST"
+  echo "Tables: $TABLE_LIST (explicit)"
 else
-  echo "Tables: All available tables"
+  echo "Tables: All tables (via dynamic discovery)"
 fi
 echo ""
 
@@ -63,7 +79,7 @@ fi
 echo ""
 echo "Creating DLT pipeline..."
 
-# Build configuration object
+# Build configuration object (conditionally include table_list)
 if [ -n "$TABLE_LIST" ]; then
   CONFIG_JSON=$(jq -n \
     --arg source_name "$SOURCE_NAME" \
@@ -74,6 +90,7 @@ if [ -n "$TABLE_LIST" ]; then
       connection_name: $connection_name,
       table_list: $table_list
     }')
+  echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONNECTION_NAME, table_list=$TABLE_LIST"
 else
   CONFIG_JSON=$(jq -n \
     --arg source_name "$SOURCE_NAME" \
@@ -82,6 +99,7 @@ else
       source_name: $source_name,
       connection_name: $connection_name
     }')
+  echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONNECTION_NAME (table_list will be discovered dynamically)"
 fi
 
 # Build full pipeline JSON
