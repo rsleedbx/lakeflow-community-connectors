@@ -9,13 +9,17 @@ set -e
 
 SOURCE_NAME="cockroachdb"
 
-# Find repository root (where scripts/merge_python_source.py exists)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# Find repository root using git
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$REPO_ROOT" ]; then
+  echo "❌ Error: Not in a git repository"
+  echo "   This script must be run from within the lakeflow-community-connectors repository"
+  exit 1
+fi
 
 # Verify we found the repo root
 if [ ! -f "$REPO_ROOT/scripts/merge_python_source.py" ]; then
-  echo "❌ Error: Could not find repository root"
+  echo "❌ Error: Could not find required script"
   echo "   Looking for: $REPO_ROOT/scripts/merge_python_source.py"
   exit 1
 fi
