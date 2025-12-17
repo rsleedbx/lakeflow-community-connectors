@@ -1,28 +1,46 @@
 #!/bin/bash
 # Create DLT pipeline for CockroachDB connector
-# Usage: ./createpipeline.sh <connection_name> [table_list]
+# Usage: ./createpipeline.sh <connection_name> <table_list>
 #
 # Examples:
-#   ./createpipeline.sh cockroachdb_connection                     # All tables (dynamic discovery)
-#   ./createpipeline.sh cockroachdb_connection "customers,orders"  # Specific tables
+#   ./createpipeline.sh cockroachdb_connection "usertable"              # YCSB workload
+#   ./createpipeline.sh cockroachdb_connection "customers,orders"       # Multiple tables
 #
-# Note: table_list is OPTIONAL
-#   - If not provided: All tables will be discovered via list_tables()
-#   - If provided: Only specified tables will be ingested
+# Note: table_list is REQUIRED (comma-separated, no spaces)
 
 SOURCE_NAME="cockroachdb"
 CONNECTION_NAME="${1:-}"
-TABLE_LIST="${2:-}"  # Optional: specific tables to ingest
+TABLE_LIST="${2:-}"  # Required: specific tables to ingest
 
 # Validate required arguments
 if [ -z "$CONNECTION_NAME" ]; then
   echo "❌ Error: connection_name is required"
   echo ""
-  echo "Usage: $0 <connection_name> [table_list]"
+  echo "Usage: $0 <connection_name> <table_list>"
   echo ""
   echo "Examples:"
-  echo "  $0 cockroachdb_connection                      # Ingest all tables"
-  echo "  $0 cockroachdb_connection \"customers,orders\"   # Ingest specific tables"
+  echo "  $0 cockroachdb_connection \"usertable\"          # YCSB workload"
+  echo "  $0 cockroachdb_connection \"customers,orders\"   # Multiple tables"
+  echo ""
+  exit 1
+fi
+
+if [ -z "$TABLE_LIST" ]; then
+  echo "❌ Error: table_list is required"
+  echo ""
+  echo "Usage: $0 <connection_name> <table_list>"
+  echo ""
+  echo "Please specify tables as a comma-separated list:"
+  echo "  $0 $CONNECTION_NAME \"usertable\"                # For YCSB workload"
+  echo "  $0 $CONNECTION_NAME \"customers,orders\"         # For multiple tables"
+  echo ""
+  echo "To discover available tables, connect to your CockroachDB cluster and run:"
+  echo "  SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"
+  echo ""
+  echo "Why is this required?"
+  echo "  Community Connectors cannot dynamically discover tables because connection"
+  echo "  credentials are only available during Spark execution, after the pipeline"
+  echo "  spec has already been defined."
   echo ""
   exit 1
 fi
@@ -43,11 +61,7 @@ echo "Creating DLT pipeline for $SOURCE_NAME connector..."
 echo "User: $USER_NAME"
 echo "Connection: $CONNECTION_NAME"
 echo "Pipeline name: $PIPELINE_NAME"
-if [ -n "$TABLE_LIST" ]; then
-  echo "Tables: $TABLE_LIST (explicit)"
-else
-  echo "Tables: All tables (via dynamic discovery)"
-fi
+echo "Tables: $TABLE_LIST"
 echo ""
 
 # Check if pipeline exists and delete it
@@ -79,28 +93,17 @@ fi
 echo ""
 echo "Creating DLT pipeline..."
 
-# Build configuration object (conditionally include table_list)
-if [ -n "$TABLE_LIST" ]; then
-  CONFIG_JSON=$(jq -n \
-    --arg source_name "$SOURCE_NAME" \
-    --arg connection_name "$CONNECTION_NAME" \
-    --arg table_list "$TABLE_LIST" \
-    '{
-      source_name: $source_name,
-      connection_name: $connection_name,
-      table_list: $table_list
-    }')
-  echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONNECTION_NAME, table_list=$TABLE_LIST"
-else
-  CONFIG_JSON=$(jq -n \
-    --arg source_name "$SOURCE_NAME" \
-    --arg connection_name "$CONNECTION_NAME" \
-    '{
-      source_name: $source_name,
-      connection_name: $connection_name
-    }')
-  echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONNECTION_NAME (table_list will be discovered dynamically)"
-fi
+# Build configuration object
+CONFIG_JSON=$(jq -n \
+  --arg source_name "$SOURCE_NAME" \
+  --arg connection_name "$CONNECTION_NAME" \
+  --arg table_list "$TABLE_LIST" \
+  '{
+    source_name: $source_name,
+    connection_name: $connection_name,
+    table_list: $table_list
+  }')
+echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONNECTION_NAME, table_list=$TABLE_LIST"
 
 # Build full pipeline JSON
 PIPELINE_JSON=$(jq -n \

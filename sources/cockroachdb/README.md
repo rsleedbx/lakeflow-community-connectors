@@ -807,6 +807,7 @@ databricks connections create --json '{
   "name": "'"$CONNECTION_NAME"'",
   "connection_type": "GENERIC_LAKEFLOW_CONNECT",
   "options": {
+    "sourceName": "cockroachdb",
     "host": "'"$HOST"'",
     "port": "'"$PORT"'",
     "database": "'"$DATABASE"'",
