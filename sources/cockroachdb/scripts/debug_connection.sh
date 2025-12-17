@@ -15,7 +15,7 @@ echo ""
 
 # Step 1: Check if connection exists
 echo "━━━ Step 1: Check if connection exists ━━━"
-if databricks api get "/api/2.0/unity-catalog/connections/$CONNECTION_NAME" --output json > /tmp/conn_check.json 2>&1; then
+if databricks api get "/api/2.0/unity-catalog/connections/$CONNECTION_NAME" > /tmp/conn_check.json 2>&1; then
   echo "✅ Connection exists"
   echo ""
   
@@ -78,7 +78,7 @@ else
   cat /tmp/conn_check.json 2>/dev/null
   echo ""
   echo "━━━ Available connections ━━━"
-  databricks api get "/api/2.0/unity-catalog/connections" --output json | jq -r '.connections[] | .name' 2>/dev/null || echo "Could not list connections"
+  databricks api get "/api/2.0/unity-catalog/connections" | jq -r '.connections[] | .name' 2>/dev/null || echo "Could not list connections"
   echo ""
   echo "Fix: Create the connection:"
   echo "  cd /Users/robert.lee/github/lakeflow-community-connectors/sources/cockroachdb/scripts"
