@@ -53,6 +53,9 @@ class LakeflowConnect:
             print(f"  {key}: {value}")
         print("=" * 80)
         
+        # Schema is always from options (not from connection)
+        self.schema = options.get("schema", "public")
+        
         # CRITICAL: Unity Catalog passes connection NAME, not credentials!
         # We must fetch credentials from Unity Catalog using the connection name
         
@@ -61,7 +64,7 @@ class LakeflowConnect:
         if connection_name:
             print(f"✓ Found Unity Catalog connection: {connection_name}")
             print(f"  Fetching credentials from Unity Catalog...")
-            self._fetch_credentials_from_uc(connection_name)
+            self._fetch_credentials_from_uc(connection_name, options)
         # Fallback: Direct credential modes (for local testing without Unity Catalog)
         elif options.get("token"):
             print("✓ Using 'token' parameter (direct testing mode)")
@@ -84,7 +87,7 @@ class LakeflowConnect:
             self.database = None
             self.user = None
     
-    def _fetch_credentials_from_uc(self, connection_name: str) -> None:
+    def _fetch_credentials_from_uc(self, connection_name: str, options: Dict[str, str]) -> None:
         """
         Fetch connection credentials from Unity Catalog.
         
@@ -140,8 +143,6 @@ class LakeflowConnect:
             self.host = None
             self.database = None
             self.user = None
-        
-        self.schema = options.get("schema", "public")
         
         # Validate required parameters (password can be empty)
         if not all([self.host, self.database, self.user is not None]):
