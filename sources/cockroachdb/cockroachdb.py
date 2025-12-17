@@ -7,6 +7,8 @@ from pyspark.sql.types import (
     DoubleType, BooleanType, DateType, TimestampType, BinaryType,
     DecimalType, ArrayType
 )
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config
 
 
 class LakeflowConnect:
@@ -39,34 +41,36 @@ class LakeflowConnect:
         print("=" * 80)
         print(f"Options received from Unity Catalog connection:")
         print(f"  Total options: {len(options)}")
+        print(f"\nALL OPTIONS (raw dump):")
         for key in sorted(options.keys()):
-            # Mask sensitive fields
-            if key.lower() in ("password", "connection_url", "api_key", "token"):
-                value = "***" if options[key] else "(empty)"
+            # Mask ONLY passwords for security
+            if "password" in key.lower():
+                value = "***REDACTED***"
             else:
+                # Show everything else, even if potentially sensitive
+                # This is for debugging - we need to see what UC actually passes
                 value = options[key]
             print(f"  {key}: {value}")
         print("=" * 80)
         
-        # Try different parameter modes to discover what Unity Catalog passes
+        # CRITICAL: Unity Catalog passes connection NAME, not credentials!
+        # We must fetch credentials from Unity Catalog using the connection name
         
-        # Mode 1: GitHub-style parameters (token + base_url)
-        # This is a diagnostic test: if this works but host/port/etc don't,
-        # it means Unity Catalog has parameter name restrictions
-        token = options.get("token")  # Full URL with credentials
-        base_url = options.get("base_url")  # URL without credentials (for reference)
+        connection_name = options.get("databricks.connection")
         
-        if token:
-            print("✓ Using 'token' parameter (GitHub-style, diagnostic mode)")
-            print(f"  This means Unity Catalog DOES pass 'token' but might NOT pass 'host'/'port'/etc.")
-            self._parse_connection_url(token)
-        # Mode 2: Single connection_url parameter
+        if connection_name:
+            print(f"✓ Found Unity Catalog connection: {connection_name}")
+            print(f"  Fetching credentials from Unity Catalog...")
+            self._fetch_credentials_from_uc(connection_name)
+        # Fallback: Direct credential modes (for local testing without Unity Catalog)
+        elif options.get("token"):
+            print("✓ Using 'token' parameter (direct testing mode)")
+            self._parse_connection_url(options.get("token"))
         elif options.get("connection_url"):
-            print("✓ Using 'connection_url' parameter (single parameter mode)")
+            print("✓ Using 'connection_url' parameter (direct testing mode)")
             self._parse_connection_url(options.get("connection_url"))
-        # Mode 3: Individual database parameters
         elif options.get("host"):
-            print("✓ Using individual parameters (host, port, database, user, password)")
+            print("✓ Using individual parameters (direct testing mode)")
             self.host = options.get("host")
             self.port = int(options.get("port", "26257"))
             self.database = options.get("database")
@@ -76,6 +80,63 @@ class LakeflowConnect:
         else:
             print("❌ No recognized connection parameters found!")
             print(f"   Available keys: {sorted(options.keys())}")
+            self.host = None
+            self.database = None
+            self.user = None
+    
+    def _fetch_credentials_from_uc(self, connection_name: str) -> None:
+        """
+        Fetch connection credentials from Unity Catalog.
+        
+        Unity Catalog stores credentials securely. We fetch them using Databricks SDK.
+        """
+        try:
+            # Initialize Databricks SDK client
+            # It will use the same authentication as the Databricks CLI/environment
+            w = WorkspaceClient()
+            
+            print(f"  Fetching connection details...")
+            connection = w.connections.get(connection_name)
+            
+            print(f"  Connection type: {connection.connection_type}")
+            print(f"  Connection options available: {list(connection.options.keys()) if connection.options else []}")
+            
+            # Extract credentials from connection options
+            conn_opts = connection.options or {}
+            
+            # Try token-based connection (GitHub-style)
+            if "token" in conn_opts:
+                print(f"  ✅ Found 'token' parameter, parsing as connection URL")
+                self._parse_connection_url(conn_opts["token"])
+                return
+            
+            # Try connection_url
+            if "connection_url" in conn_opts:
+                print(f"  ✅ Found 'connection_url' parameter")
+                self._parse_connection_url(conn_opts["connection_url"])
+                return
+            
+            # Try individual parameters
+            if "host" in conn_opts:
+                print(f"  ✅ Found individual database parameters")
+                self.host = conn_opts.get("host")
+                self.port = int(conn_opts.get("port", "26257"))
+                self.database = conn_opts.get("database")
+                self.user = conn_opts.get("user")
+                self.password = conn_opts.get("password", "")
+                self.sslmode = conn_opts.get("sslmode", "require")
+                return
+            
+            # No credentials found
+            print(f"  ❌ No credentials found in Unity Catalog connection!")
+            print(f"     Available options: {sorted(conn_opts.keys())}")
+            self.host = None
+            self.database = None
+            self.user = None
+            
+        except Exception as e:
+            print(f"  ❌ Failed to fetch credentials from Unity Catalog: {e}")
+            print(f"     This might be a permissions issue or SDK configuration problem")
             self.host = None
             self.database = None
             self.user = None
