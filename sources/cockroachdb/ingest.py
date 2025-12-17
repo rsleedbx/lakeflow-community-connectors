@@ -30,6 +30,7 @@ To discover available tables:
 3. Specify the tables you want in table_list parameter
 """
 
+import os
 from pipeline.ingestion_pipeline import ingest
 from libs.source_loader import get_register_function
 
@@ -39,43 +40,121 @@ print("=" * 80)
 print("🔍 DEBUG: CockroachDB Ingest Pipeline Starting")
 print("=" * 80)
 
-# Debug: Print all DLT configuration for troubleshooting
-print("\n📋 All DLT Configuration Keys:")
+# Debug: Check environment variables (DLT might use these)
+print("\n🌍 Environment Variables (filtered for config):")
+config_env_vars = {k: v for k, v in os.environ.items() if any(x in k.lower() for x in ['connection', 'table', 'source', 'databricks'])}
+if config_env_vars:
+    for key, val in sorted(config_env_vars.items()):
+        print(f"  {key}: {val}")
+else:
+    print("  ⚠️  No config-related environment variables found")
+
+# Debug: Check Spark configuration
+print("\n⚙️  Spark Configuration (all keys):")
 try:
-    # spark.conf.getAll() can return either a list of tuples or a dict depending on Spark version
-    all_conf = spark.conf.getAll()
+    # Try as property first (newer Spark)
+    try:
+        all_conf = spark.conf.getAll
+        if callable(all_conf):
+            all_conf = all_conf()
+    except:
+        all_conf = spark.conf.getAll()
     
-    # Convert to dict if it's a list of tuples
+    # Convert to dict if needed
     if isinstance(all_conf, list):
         conf_dict = dict(all_conf)
-    else:
+    elif isinstance(all_conf, dict):
         conf_dict = all_conf
-    
-    # Filter for DLT configuration keys
-    dlt_conf = {k: v for k, v in conf_dict.items() if "databricks.pipeline.configuration" in k}
-    
-    if dlt_conf:
-        for key, val in dlt_conf.items():
-            print(f"  {key}: {val}")
     else:
-        print("  ⚠️  No DLT configuration keys found!")
-        print(f"  Total spark.conf keys: {len(conf_dict)}")
-        # Print a few keys for debugging
-        print("  Sample keys:")
-        for i, key in enumerate(list(conf_dict.keys())[:5]):
+        conf_dict = {}
+    
+    print(f"  Total keys: {len(conf_dict)}")
+    
+    # Show config-related keys
+    config_keys = {k: v for k, v in conf_dict.items() if 'configuration' in k.lower() or 'connection' in k.lower()}
+    if config_keys:
+        print("  Configuration-related keys:")
+        for key, val in sorted(config_keys.items()):
+            print(f"    {key}: {val}")
+    else:
+        print("  ⚠️  No configuration keys found in spark.conf")
+        print("  Sample of first 10 keys:")
+        for key in list(conf_dict.keys())[:10]:
             print(f"    {key}")
+            
 except Exception as e:
     print(f"  ❌ Error reading spark configuration: {e}")
 
-# Read configuration from DLT pipeline configuration (via Spark config)
-# DLT exposes pipeline configuration with the prefix: spark.databricks.pipeline.configuration.
-print("\n📖 Reading Pipeline Configuration:")
-connection_name = spark.conf.get("spark.databricks.pipeline.configuration.connection_name", "cockroachdb_connection")
-table_list_str = spark.conf.get("spark.databricks.pipeline.configuration.table_list", "")  # Required: comma-separated list
+# Read configuration from DLT pipeline configuration
+# DLT can expose config via: environment variables, spark.conf, or both
+print("\n📖 Reading Pipeline Configuration (trying multiple methods):")
 
-print(f"  ✓ connection_name: '{connection_name}'")
-print(f"  ✓ table_list: '{table_list_str or 'NOT SET'}'")
-print(f"  ✓ source_name: '{source_name}'")
+connection_name = None
+table_list_str = None
+
+# Method 1: Try environment variables
+print("\n  Method 1: Environment Variables")
+for env_key in ['CONNECTION_NAME', 'connection_name', 'DATABRICKS_CONNECTION_NAME']:
+    val = os.environ.get(env_key)
+    if val:
+        connection_name = val
+        print(f"    ✓ Found connection_name: {env_key} = '{val}'")
+        break
+else:
+    print("    ✗ connection_name not found in env vars")
+
+for env_key in ['TABLE_LIST', 'table_list', 'DATABRICKS_TABLE_LIST']:
+    val = os.environ.get(env_key)
+    if val:
+        table_list_str = val
+        print(f"    ✓ Found table_list: {env_key} = '{val}'")
+        break
+else:
+    print("    ✗ table_list not found in env vars")
+
+# Method 2: Try spark.conf with various prefixes
+print("\n  Method 2: Spark Configuration")
+if not connection_name:
+    for spark_key in [
+        "connection_name",
+        "databricks.pipeline.configuration.connection_name",
+        "spark.databricks.pipeline.configuration.connection_name",
+    ]:
+        val = spark.conf.get(spark_key, None)
+        if val:
+            connection_name = val
+            print(f"    ✓ Found connection_name: {spark_key} = '{val}'")
+            break
+    else:
+        print("    ✗ connection_name not found in spark.conf")
+
+if not table_list_str:
+    for spark_key in [
+        "table_list",
+        "databricks.pipeline.configuration.table_list",
+        "spark.databricks.pipeline.configuration.table_list",
+    ]:
+        val = spark.conf.get(spark_key, None)
+        if val:
+            table_list_str = val
+            print(f"    ✓ Found table_list: {spark_key} = '{val}'")
+            break
+    else:
+        print("    ✗ table_list not found in spark.conf")
+
+# Apply defaults if still not found
+if not connection_name:
+    connection_name = "cockroachdb_connection"
+    print(f"\n  ⚠️  Using DEFAULT connection_name: '{connection_name}'")
+
+if not table_list_str:
+    table_list_str = ""
+    print(f"  ⚠️  table_list NOT FOUND - will fail or use default")
+
+print(f"\n📝 Final Configuration Values:")
+print(f"    connection_name: '{connection_name}'")
+print(f"    table_list: '{table_list_str or 'NOT SET'}'")
+print(f"    source_name: '{source_name}'")
 
 # Validate and parse table list
 if not table_list_str:
