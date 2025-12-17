@@ -8,13 +8,26 @@
 #   ./createpipeline.sh cockroachdb_connection "usertable"              # Explicit YCSB workload
 #   ./createpipeline.sh my_connection "customers,orders"                # Custom connection and tables
 #
+# If CONNECTION_NAME is exported (e.g., from create_databricks_connection.sh):
+#   source ./create_databricks_connection.sh "$URL" && ./createpipeline.sh
+#
 # Defaults:
-#   connection_name: cockroachdb_connection
+#   connection_name: $CONNECTION_NAME env var, or "cockroachdb_connection" if not set
 #   table_list: usertable (YCSB workload)
 
 SOURCE_NAME="cockroachdb"
-CONNECTION_NAME="${1:-cockroachdb_connection}"  # Default to cockroachdb_connection
-TABLE_LIST="${2:-usertable}"                     # Default to YCSB usertable for testing
+
+# Use CONNECTION_NAME from environment if set, otherwise use parameter or default
+if [ -n "$CONNECTION_NAME" ] && [ -z "$1" ]; then
+  # CONNECTION_NAME is exported and no explicit parameter provided
+  CONN="${CONNECTION_NAME}"
+  echo "📌 Using exported CONNECTION_NAME: $CONN"
+else
+  # Use parameter or default
+  CONN="${1:-cockroachdb_connection}"
+fi
+
+TABLE_LIST="${2:-usertable}"  # Default to YCSB usertable for testing
 
 # Get current username and workspace URL
 USER_NAME=$(databricks current-user me --output json | jq -r '.userName')
@@ -31,11 +44,13 @@ PIPELINE_NAME="$(echo $USER_NAME | cut -d'@' -f1 | tr '.' '_')_${SOURCE_NAME}"
 echo "Creating DLT pipeline for $SOURCE_NAME connector..."
 echo "User: $USER_NAME"
 
-# Show connection with default indicator
-if [ "$CONNECTION_NAME" = "cockroachdb_connection" ] && [ "$1" = "" ]; then
-  echo "Connection: $CONNECTION_NAME (default)"
+# Show connection with appropriate indicator
+if [ "$CONN" = "cockroachdb_connection" ] && [ -z "$1" ] && [ -z "$CONNECTION_NAME" ]; then
+  echo "Connection: $CONN (default)"
+elif [ -n "$CONNECTION_NAME" ] && [ -z "$1" ]; then
+  echo "Connection: $CONN (from \$CONNECTION_NAME)"
 else
-  echo "Connection: $CONNECTION_NAME"
+  echo "Connection: $CONN"
 fi
 
 echo "Pipeline name: $PIPELINE_NAME"
@@ -80,14 +95,14 @@ echo "Creating DLT pipeline..."
 # Build configuration object
 CONFIG_JSON=$(jq -n \
   --arg source_name "$SOURCE_NAME" \
-  --arg connection_name "$CONNECTION_NAME" \
+  --arg connection_name "$CONN" \
   --arg table_list "$TABLE_LIST" \
   '{
     source_name: $source_name,
     connection_name: $connection_name,
     table_list: $table_list
   }')
-echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONNECTION_NAME, table_list=$TABLE_LIST"
+echo "Configuration: source_name=$SOURCE_NAME, connection_name=$CONN, table_list=$TABLE_LIST"
 
 # Build full pipeline JSON
 PIPELINE_JSON=$(jq -n \
