@@ -28,6 +28,21 @@ class LakeflowConnect:
         """
         self.conn = None  # Initialize conn first for __del__
         
+        # Debug: Print what options we actually receive from Unity Catalog
+        print("=" * 80)
+        print("🔍 DEBUG: CockroachDB Connector __init__ called")
+        print("=" * 80)
+        print(f"Options received from Unity Catalog connection:")
+        print(f"  Total options: {len(options)}")
+        for key in sorted(options.keys()):
+            # Mask password for security
+            if key.lower() == "password":
+                value = "***" if options[key] else "(empty)"
+            else:
+                value = options[key]
+            print(f"  {key}: {value}")
+        print("=" * 80)
+        
         self.host = options.get("host")
         self.port = int(options.get("port", "26257"))
         self.database = options.get("database")
@@ -38,6 +53,12 @@ class LakeflowConnect:
         
         # Validate required parameters (password can be empty)
         if not all([self.host, self.database, self.user is not None]):
+            print("\n❌ ERROR: Missing required connection parameters!")
+            print(f"  host: {self.host}")
+            print(f"  database: {self.database}")
+            print(f"  user: {self.user}")
+            print(f"\nThis likely means Unity Catalog is not passing these options to the connector.")
+            print(f"Connection might only contain: sourceName (and other metadata)")
             raise ValueError("Missing required connection parameters: host, database, user")
         
         self._init_connection()
