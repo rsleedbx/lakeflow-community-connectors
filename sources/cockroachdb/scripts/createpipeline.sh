@@ -59,41 +59,72 @@ else
   echo "✅ Schema already exists"
 fi
 
-# Build configuration JSON
-CONFIG_JSON='{'
-CONFIG_JSON+=' "source_name": "'$SOURCE_NAME'",'
-CONFIG_JSON+=' "connection_name": "'$CONNECTION_NAME'"'
-
-if [ -n "$TABLE_LIST" ]; then
-  CONFIG_JSON+=', "table_list": "'$TABLE_LIST'"'
-fi
-
-CONFIG_JSON+=' }'
-
-# Create new pipeline
+# Build pipeline JSON using jq for proper JSON construction
 echo ""
 echo "Creating DLT pipeline..."
-databricks pipelines create \
-  --json '{
-    "name": "'$PIPELINE_NAME'",
-    "catalog": "main",
-    "schema": "'${PIPELINE_NAME}'",
-    "configuration": '$CONFIG_JSON',
-    "serverless": true,
-    "continuous": false,
-    "development": true,
-    "libraries": [
+
+# Build configuration object
+if [ -n "$TABLE_LIST" ]; then
+  CONFIG_JSON=$(jq -n \
+    --arg source_name "$SOURCE_NAME" \
+    --arg connection_name "$CONNECTION_NAME" \
+    --arg table_list "$TABLE_LIST" \
+    '{
+      source_name: $source_name,
+      connection_name: $connection_name,
+      table_list: $table_list
+    }')
+else
+  CONFIG_JSON=$(jq -n \
+    --arg source_name "$SOURCE_NAME" \
+    --arg connection_name "$CONNECTION_NAME" \
+    '{
+      source_name: $source_name,
+      connection_name: $connection_name
+    }')
+fi
+
+# Build full pipeline JSON
+PIPELINE_JSON=$(jq -n \
+  --arg name "$PIPELINE_NAME" \
+  --arg schema "$PIPELINE_NAME" \
+  --arg ingest_path "$PROJECT_PATH/ingest.py" \
+  --argjson config "$CONFIG_JSON" \
+  '{
+    name: $name,
+    catalog: "main",
+    schema: $schema,
+    configuration: $config,
+    serverless: true,
+    continuous: false,
+    development: true,
+    libraries: [
       {
-        "file": {
-          "path": "'$PROJECT_PATH'/ingest.py"
+        file: {
+          path: $ingest_path
         }
       }
     ]
-  }' | tee /tmp/$PIPELINE_NAME.$$
+  }')
 
-# Extract pipeline ID from saved response
-PIPELINE_ID=$(cat /tmp/$PIPELINE_NAME.$$ | jq -r '.pipeline_id')
-rm -f /tmp/$PIPELINE_NAME.$$
+# Create pipeline
+RESPONSE=$(databricks pipelines create --json "$PIPELINE_JSON" 2>&1)
+
+# Check if command succeeded
+if echo "$RESPONSE" | grep -q "Error:"; then
+  echo "❌ Failed to create pipeline:"
+  echo "$RESPONSE"
+  exit 1
+fi
+
+# Extract pipeline ID from response
+PIPELINE_ID=$(echo "$RESPONSE" | jq -r '.pipeline_id // empty')
+
+if [ -z "$PIPELINE_ID" ]; then
+  echo "❌ Failed to extract pipeline ID from response:"
+  echo "$RESPONSE"
+  exit 1
+fi
 
 echo ""
 echo "✅ Pipeline created!"
