@@ -60,37 +60,48 @@ SSLMODE="${SSLMODE:-require}"
 
 echo "Configuring Databricks connection with:"
 echo "  Name: $CONNECTION_NAME"
-echo "  Host: $HOST"
-echo "  Port: $PORT"
-echo "  Database: $DATABASE"
-echo "  User: $USER"
-echo "  SSL Mode: $SSLMODE"
+echo "  Connection URL: $CONNECTION_URL"
+echo ""
+echo "Testing TWO modes to see which one Unity Catalog supports:"
+echo "  Mode 1: Single 'connection_url' parameter (like 'token' in other connectors)"
+echo "  Mode 2: Individual parameters (host, port, database, user, password)"
 echo ""
 
 # Check if connection already exists
 if databricks connections get "$CONNECTION_NAME" &>/dev/null; then
   echo "⚠️  Connection '$CONNECTION_NAME' already exists"
-  echo "Updating existing connection..."
-  
-  databricks connections update "$CONNECTION_NAME" --json '{
-    "options": {
-      "sourceName": "cockroachdb",
-      "host": "'"$HOST"'",
-      "port": "'"$PORT"'",
-      "database": "'"$DATABASE"'",
-      "user": "'"$USER"'",
-      "password": "'"$PASSWORD"'",
-      "sslmode": "'"$SSLMODE"'",
-      "schema": "public",
-      "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
-    }
-  }'
-  
+  echo "Deleting and recreating to test both modes..."
+  databricks connections delete "$CONNECTION_NAME"
+  sleep 2
+fi
+
+# Test Mode 1: Single connection_url parameter
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🧪 MODE 1: Using 'connection_url' (single parameter, like GitHub/HubSpot/Stripe)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+databricks connections create --json '{
+  "name": "'"$CONNECTION_NAME"'",
+  "connection_type": "GENERIC_LAKEFLOW_CONNECT",
+  "options": {
+    "sourceName": "cockroachdb",
+    "connection_url": "'"$CONNECTION_URL"'",
+    "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
+  }
+}'
+
+if [ $? -eq 0 ]; then
   echo ""
-  echo "✅ Connection '$CONNECTION_NAME' updated successfully!"
+  echo "✅ SUCCESS: Mode 1 works! Unity Catalog accepts 'connection_url' parameter."
+  echo "   This is consistent with other connectors (GitHub, HubSpot, Stripe)."
 else
-  echo "Creating new connection..."
+  echo ""
+  echo "❌ FAILED: Mode 1 did not work. Trying Mode 2..."
+  echo ""
   
+  # Test Mode 2: Individual parameters
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🧪 MODE 2: Using individual parameters (host, port, database, user, password)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   databricks connections create --json '{
     "name": "'"$CONNECTION_NAME"'",
     "connection_type": "GENERIC_LAKEFLOW_CONNECT",
@@ -107,8 +118,14 @@ else
     }
   }'
   
-  echo ""
-  echo "✅ Connection '$CONNECTION_NAME' created successfully!"
+  if [ $? -eq 0 ]; then
+    echo ""
+    echo "✅ SUCCESS: Mode 2 works! Unity Catalog accepts individual parameters."
+  else
+    echo ""
+    echo "❌ FAILED: Both modes failed! Please check error messages above."
+    exit 1
+  fi
 fi
 
 echo ""

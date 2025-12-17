@@ -16,15 +16,20 @@ class LakeflowConnect:
         """
         Initialize the CockroachDB connector.
         
-        Args:
-            options: Dictionary containing:
-                - host: CockroachDB host
-                - port: CockroachDB port (default: 26257)
-                - database: Database name
-                - user: Username
-                - password: Password (can be empty for insecure mode)
-                - sslmode: SSL mode (default: 'require')
-                - schema: Schema name (default: 'public')
+        Supports two connection modes:
+        
+        1. Connection URL (recommended - single parameter like other connectors):
+            - connection_url: PostgreSQL connection string
+              Format: postgresql://user:password@host:port/database?sslmode=require
+        
+        2. Individual parameters (legacy - may not work with Unity Catalog):
+            - host: CockroachDB host
+            - port: CockroachDB port (default: 26257)
+            - database: Database name
+            - user: Username
+            - password: Password (can be empty for insecure mode)
+            - sslmode: SSL mode (default: 'require')
+            - schema: Schema name (default: 'public')
         """
         self.conn = None  # Initialize conn first for __del__
         
@@ -35,20 +40,29 @@ class LakeflowConnect:
         print(f"Options received from Unity Catalog connection:")
         print(f"  Total options: {len(options)}")
         for key in sorted(options.keys()):
-            # Mask password for security
-            if key.lower() == "password":
+            # Mask sensitive fields
+            if key.lower() in ("password", "connection_url", "api_key", "token"):
                 value = "***" if options[key] else "(empty)"
             else:
                 value = options[key]
             print(f"  {key}: {value}")
         print("=" * 80)
         
-        self.host = options.get("host")
-        self.port = int(options.get("port", "26257"))
-        self.database = options.get("database")
-        self.user = options.get("user")
-        self.password = options.get("password", "")  # Empty password is valid for insecure mode
-        self.sslmode = options.get("sslmode", "require")
+        # Try connection_url first (recommended for Unity Catalog)
+        connection_url = options.get("connection_url")
+        if connection_url:
+            print("✓ Using connection_url (single parameter mode)")
+            self._parse_connection_url(connection_url)
+        else:
+            print("✓ Using individual parameters (legacy mode)")
+            # Fall back to individual parameters
+            self.host = options.get("host")
+            self.port = int(options.get("port", "26257"))
+            self.database = options.get("database")
+            self.user = options.get("user")
+            self.password = options.get("password", "")
+            self.sslmode = options.get("sslmode", "require")
+        
         self.schema = options.get("schema", "public")
         
         # Validate required parameters (password can be empty)
@@ -57,9 +71,37 @@ class LakeflowConnect:
             print(f"  host: {self.host}")
             print(f"  database: {self.database}")
             print(f"  user: {self.user}")
-            print(f"\nThis likely means Unity Catalog is not passing these options to the connector.")
-            print(f"Connection might only contain: sourceName (and other metadata)")
+            print(f"\nPossible causes:")
+            print(f"  1. Unity Catalog is not passing individual parameters (host, port, etc.)")
+            print(f"  2. Try using 'connection_url' parameter instead (single string)")
+            print(f"     Format: postgresql://user:password@host:port/database?sslmode=require")
             raise ValueError("Missing required connection parameters: host, database, user")
+    
+    def _parse_connection_url(self, url: str) -> None:
+        """Parse PostgreSQL connection URL into individual components."""
+        import re
+        from urllib.parse import urlparse, parse_qs
+        
+        # Parse URL: postgresql://user:password@host:port/database?params
+        parsed = urlparse(url)
+        
+        self.user = parsed.username
+        self.password = parsed.password or ""
+        self.host = parsed.hostname
+        self.port = parsed.port or 26257
+        self.database = parsed.path.lstrip("/").split("?")[0]
+        
+        # Parse query parameters
+        query_params = parse_qs(parsed.query)
+        self.sslmode = query_params.get("sslmode", ["require"])[0]
+        
+        print(f"  Parsed from connection_url:")
+        print(f"    host: {self.host}")
+        print(f"    port: {self.port}")
+        print(f"    database: {self.database}")
+        print(f"    user: {self.user}")
+        print(f"    password: {'***' if self.password else '(empty)'}")
+        print(f"    sslmode: {self.sslmode}")
         
         self._init_connection()
     
