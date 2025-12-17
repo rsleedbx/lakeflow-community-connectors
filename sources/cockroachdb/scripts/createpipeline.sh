@@ -1,49 +1,20 @@
 #!/bin/bash
 # Create DLT pipeline for CockroachDB connector
-# Usage: ./createpipeline.sh <connection_name> <table_list>
+# Usage: ./createpipeline.sh [connection_name] [table_list]
 #
 # Examples:
-#   ./createpipeline.sh cockroachdb_connection "usertable"              # YCSB workload
-#   ./createpipeline.sh cockroachdb_connection "customers,orders"       # Multiple tables
+#   ./createpipeline.sh                                                 # All defaults (YCSB testing)
+#   ./createpipeline.sh cockroachdb_connection                          # Default table: usertable
+#   ./createpipeline.sh cockroachdb_connection "usertable"              # Explicit YCSB workload
+#   ./createpipeline.sh my_connection "customers,orders"                # Custom connection and tables
 #
-# Note: table_list is REQUIRED (comma-separated, no spaces)
+# Defaults:
+#   connection_name: cockroachdb_connection
+#   table_list: usertable (YCSB workload)
 
 SOURCE_NAME="cockroachdb"
-CONNECTION_NAME="${1:-}"
-TABLE_LIST="${2:-}"  # Required: specific tables to ingest
-
-# Validate required arguments
-if [ -z "$CONNECTION_NAME" ]; then
-  echo "❌ Error: connection_name is required"
-  echo ""
-  echo "Usage: $0 <connection_name> <table_list>"
-  echo ""
-  echo "Examples:"
-  echo "  $0 cockroachdb_connection \"usertable\"          # YCSB workload"
-  echo "  $0 cockroachdb_connection \"customers,orders\"   # Multiple tables"
-  echo ""
-  exit 1
-fi
-
-if [ -z "$TABLE_LIST" ]; then
-  echo "❌ Error: table_list is required"
-  echo ""
-  echo "Usage: $0 <connection_name> <table_list>"
-  echo ""
-  echo "Please specify tables as a comma-separated list:"
-  echo "  $0 $CONNECTION_NAME \"usertable\"                # For YCSB workload"
-  echo "  $0 $CONNECTION_NAME \"customers,orders\"         # For multiple tables"
-  echo ""
-  echo "To discover available tables, connect to your CockroachDB cluster and run:"
-  echo "  SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"
-  echo ""
-  echo "Why is this required?"
-  echo "  Community Connectors cannot dynamically discover tables because connection"
-  echo "  credentials are only available during Spark execution, after the pipeline"
-  echo "  spec has already been defined."
-  echo ""
-  exit 1
-fi
+CONNECTION_NAME="${1:-cockroachdb_connection}"  # Default to cockroachdb_connection
+TABLE_LIST="${2:-usertable}"                     # Default to YCSB usertable for testing
 
 # Get current username and workspace URL
 USER_NAME=$(databricks current-user me --output json | jq -r '.userName')
@@ -59,9 +30,22 @@ PIPELINE_NAME="$(echo $USER_NAME | cut -d'@' -f1 | tr '.' '_')_${SOURCE_NAME}"
 
 echo "Creating DLT pipeline for $SOURCE_NAME connector..."
 echo "User: $USER_NAME"
-echo "Connection: $CONNECTION_NAME"
+
+# Show connection with default indicator
+if [ "$CONNECTION_NAME" = "cockroachdb_connection" ] && [ "$1" = "" ]; then
+  echo "Connection: $CONNECTION_NAME (default)"
+else
+  echo "Connection: $CONNECTION_NAME"
+fi
+
 echo "Pipeline name: $PIPELINE_NAME"
-echo "Tables: $TABLE_LIST"
+
+# Show tables with default indicator
+if [ "$TABLE_LIST" = "usertable" ] && [ "$2" = "" ]; then
+  echo "Tables: $TABLE_LIST (default - YCSB workload)"
+else
+  echo "Tables: $TABLE_LIST"
+fi
 echo ""
 
 # Check if pipeline exists and delete it

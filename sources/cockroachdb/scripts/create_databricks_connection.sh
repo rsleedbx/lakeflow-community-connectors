@@ -47,7 +47,7 @@ DATABASE=$(echo "$CONNECTION_URL" | sed -n 's|postgresql://[^@]*@[^/]*/\([^?]*\)
 SSLMODE=$(echo "$CONNECTION_URL" | sed -n 's|.*sslmode=\([^&]*\).*|\1|p')
 SSLMODE="${SSLMODE:-require}"
 
-echo "Creating Databricks connection with:"
+echo "Configuring Databricks connection with:"
 echo "  Name: $CONNECTION_NAME"
 echo "  Host: $HOST"
 echo "  Port: $PORT"
@@ -56,22 +56,47 @@ echo "  User: $USER"
 echo "  SSL Mode: $SSLMODE"
 echo ""
 
-databricks connections create --json '{
-  "name": "'"$CONNECTION_NAME"'",
-  "connection_type": "GENERIC_LAKEFLOW_CONNECT",
-  "options": {
-    "sourceName": "cockroachdb",
-    "host": "'"$HOST"'",
-    "port": "'"$PORT"'",
-    "database": "'"$DATABASE"'",
-    "user": "'"$USER"'",
-    "password": "'"$PASSWORD"'",
-    "sslmode": "'"$SSLMODE"'",
-    "schema": "public",
-    "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size"
-  }
-}'
-
-echo ""
-echo "✓ Connection '$CONNECTION_NAME' created successfully!"
+# Check if connection already exists
+if databricks connections get "$CONNECTION_NAME" &>/dev/null; then
+  echo "⚠️  Connection '$CONNECTION_NAME' already exists"
+  echo "Updating existing connection..."
+  
+  databricks connections update "$CONNECTION_NAME" --json '{
+    "options": {
+      "sourceName": "cockroachdb",
+      "host": "'"$HOST"'",
+      "port": "'"$PORT"'",
+      "database": "'"$DATABASE"'",
+      "user": "'"$USER"'",
+      "password": "'"$PASSWORD"'",
+      "sslmode": "'"$SSLMODE"'",
+      "schema": "public",
+      "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
+    }
+  }'
+  
+  echo ""
+  echo "✅ Connection '$CONNECTION_NAME' updated successfully!"
+else
+  echo "Creating new connection..."
+  
+  databricks connections create --json '{
+    "name": "'"$CONNECTION_NAME"'",
+    "connection_type": "GENERIC_LAKEFLOW_CONNECT",
+    "options": {
+      "sourceName": "cockroachdb",
+      "host": "'"$HOST"'",
+      "port": "'"$PORT"'",
+      "database": "'"$DATABASE"'",
+      "user": "'"$USER"'",
+      "password": "'"$PASSWORD"'",
+      "sslmode": "'"$SSLMODE"'",
+      "schema": "public",
+      "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
+    }
+  }'
+  
+  echo ""
+  echo "✅ Connection '$CONNECTION_NAME' created successfully!"
+fi
 

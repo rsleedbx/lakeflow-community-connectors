@@ -101,11 +101,14 @@ WHERE table_schema = 'public';
 #### 2. **Specify Tables in Configuration**
 
 ```bash
-# For YCSB workload (single table)
-./createpipeline.sh cockroachdb_connection "usertable"
+# Simplest form - all defaults for YCSB testing
+./createpipeline.sh
+
+# For YCSB workload with custom connection
+./createpipeline.sh my_connection
 
 # For multiple tables
-./createpipeline.sh cockroachdb_connection "customers,orders,products"
+./createpipeline.sh my_connection "customers,orders,products"
 ```
 
 #### 3. **Pipeline Configuration**
@@ -189,30 +192,58 @@ python test_local.py --workload ycsb
 
 ## Usage Examples
 
-### Example 1: YCSB Workload (Single Table)
+### Example 1: YCSB Workload (All Defaults)
 ```bash
-# Discover tables
+# Simplest form - uses all defaults for YCSB testing
+$ ./scripts/createpipeline.sh
+```
+Output:
+```
+Connection: cockroachdb_connection (default)
+Tables: usertable (default - YCSB workload)
+Pipeline spec generated for 1 tables
+Tables to ingest: usertable
+```
+
+### Example 2: Custom Connection, Default Table
+```bash
+# Use your own connection name, default table
+$ ./scripts/createpipeline.sh my_crdb_connection
+```
+Output:
+```
+Connection: my_crdb_connection
+Tables: usertable (default - YCSB workload)
+Pipeline spec generated for 1 tables
+Tables to ingest: usertable
+```
+
+### Example 3: Explicit Everything
+```bash
+# Discover tables first (optional)
 $ cockroach sql --url "$DB_URL" --execute \
   "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"
 # Returns: usertable
 
-# Create pipeline
+# Create pipeline with explicit connection and table
 $ ./scripts/createpipeline.sh cockroachdb_connection "usertable"
 ```
 Output:
 ```
+Connection: cockroachdb_connection
 Tables: usertable
 Pipeline spec generated for 1 tables
 Tables to ingest: usertable
 ```
 
-### Example 2: Multiple Tables
+### Example 4: Multiple Tables
 ```bash
 # Create pipeline with multiple tables
-$ ./scripts/createpipeline.sh cockroachdb_connection "customers,orders,products"
+$ ./scripts/createpipeline.sh my_connection "customers,orders,products"
 ```
 Output:
 ```
+Connection: my_connection
 Tables: customers,orders,products
 Pipeline spec generated for 3 tables
 Tables to ingest: customers, orders, products
@@ -238,8 +269,15 @@ default_table_config = {
 
 **Solution:** Explicitly specify `table_list` in pipeline configuration after manually discovering tables via SQL queries.
 
-For YCSB workload testing:
+For YCSB workload testing, both connection and table have sensible defaults:
 ```bash
+# Simplest form (uses all defaults: cockroachdb_connection and usertable)
+./scripts/createpipeline.sh
+
+# Or with custom connection name
+./scripts/createpipeline.sh my_connection
+
+# Or fully explicit
 ./scripts/createpipeline.sh cockroachdb_connection "usertable"
 ```
 

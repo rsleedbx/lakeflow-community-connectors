@@ -13,13 +13,16 @@ Pipeline Configuration Parameters:
 - connection_name: Name of the Unity Catalog connection (required)
 - table_list: Comma-separated list of tables to ingest (required)
 
-Example configuration:
-{"source_name": "cockroachdb", "connection_name": "my_connection", "table_list": "customers,orders,products"}
+Example configurations:
+- Single table:  {"source_name": "cockroachdb", "connection_name": "my_connection", "table_list": "usertable"}
+- Multiple tables: {"source_name": "cockroachdb", "connection_name": "my_connection", "table_list": "customers,orders,products"}
 
 Note: Community Connectors require explicit table specification because connection 
 credentials are only available during Spark execution, not during pipeline configuration.
 Unlike Managed Connectors (SQL Server, etc.), Community Connectors also do not support
 schema-level ingestion.
+
+For YCSB workload testing, use "usertable" as the table_list.
 
 To discover available tables:
 1. Connect to your CockroachDB cluster
