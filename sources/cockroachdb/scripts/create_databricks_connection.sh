@@ -62,22 +62,69 @@ echo "Configuring Databricks connection with:"
 echo "  Name: $CONNECTION_NAME"
 echo "  Connection URL: $CONNECTION_URL"
 echo ""
-echo "Testing TWO modes to see which one Unity Catalog supports:"
-echo "  Mode 1: Single 'connection_url' parameter (like 'token' in other connectors)"
-echo "  Mode 2: Individual parameters (host, port, database, user, password)"
+echo "Testing THREE modes to see which parameters Unity Catalog passes:"
+echo "  Mode 1: GitHub-style (token + base_url)"
+echo "  Mode 2: Single connection_url parameter"
+echo "  Mode 3: Individual parameters (host, port, database, user, password)"
 echo ""
 
 # Check if connection already exists
 if databricks connections get "$CONNECTION_NAME" &>/dev/null; then
   echo "⚠️  Connection '$CONNECTION_NAME' already exists"
-  echo "Deleting and recreating to test both modes..."
+  echo "Deleting and recreating to test all modes..."
   databricks connections delete "$CONNECTION_NAME"
   sleep 2
 fi
 
-# Test Mode 1: Single connection_url parameter
+# Extract base URL (without credentials) for Mode 1
+BASE_URL="postgresql://${HOST}:${PORT}/${DATABASE}?sslmode=${SSLMODE}"
+
+# Test Mode 1: GitHub-style parameters (token + base_url)
+# This is THE KEY TEST: If this works but Mode 3 doesn't, we know Unity Catalog
+# has parameter name restrictions (only passes 'token'/'base_url', not 'host'/'port'/etc.)
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "🧪 MODE 1: Using 'connection_url' (single parameter, like GitHub/HubSpot/Stripe)"
+echo "🧪 MODE 1: Using 'token' + 'base_url' (GitHub-style)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "This is the DIAGNOSTIC TEST:"
+echo "  - 'token' will contain the FULL connection URL with credentials"
+echo "  - 'base_url' will contain the URL without credentials (for reference)"
+echo ""
+echo "If Mode 1 works but Mode 3 fails, it proves Unity Catalog only passes"
+echo "specific parameter names like 'token'/'base_url' (not 'host'/'port'/etc.)."
+echo ""
+
+databricks connections create --json '{
+  "name": "'"$CONNECTION_NAME"'",
+  "connection_type": "GENERIC_LAKEFLOW_CONNECT",
+  "options": {
+    "sourceName": "cockroachdb",
+    "token": "'"$CONNECTION_URL"'",
+    "base_url": "'"$BASE_URL"'",
+    "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
+  }
+}'
+
+if [ $? -eq 0 ]; then
+  echo ""
+  echo "✅ SUCCESS: Mode 1 works! Unity Catalog passes 'token' and 'base_url'."
+  echo "   🎯 KEY FINDING: Unity Catalog uses GitHub-style parameter names!"
+  echo "   This means we should use 'token' (not 'connection_url' or 'host'/'port'/etc.)."
+  echo ""
+  echo "📝 Connection name exported as: CONNECTION_NAME=$CONNECTION_NAME"
+  echo "   Use it in the next command: "
+  echo "   ./createpipeline.sh"
+  echo ""
+  export CONNECTION_NAME
+  exit 0
+fi
+
+echo ""
+echo "⚠️  Mode 1 failed. Trying Mode 2..."
+echo ""
+
+# Test Mode 2: Single connection_url parameter
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🧪 MODE 2: Using 'connection_url' (single parameter)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 databricks connections create --json '{
   "name": "'"$CONNECTION_NAME"'",
@@ -91,42 +138,56 @@ databricks connections create --json '{
 
 if [ $? -eq 0 ]; then
   echo ""
-  echo "✅ SUCCESS: Mode 1 works! Unity Catalog accepts 'connection_url' parameter."
-  echo "   This is consistent with other connectors (GitHub, HubSpot, Stripe)."
-else
+  echo "✅ SUCCESS: Mode 2 works! Unity Catalog accepts 'connection_url' parameter."
   echo ""
-  echo "❌ FAILED: Mode 1 did not work. Trying Mode 2..."
+  echo "📝 Connection name exported as: CONNECTION_NAME=$CONNECTION_NAME"
+  echo "   Use it in the next command: "
+  echo "   ./createpipeline.sh"
   echo ""
-  
-  # Test Mode 2: Individual parameters
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "🧪 MODE 2: Using individual parameters (host, port, database, user, password)"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  databricks connections create --json '{
-    "name": "'"$CONNECTION_NAME"'",
-    "connection_type": "GENERIC_LAKEFLOW_CONNECT",
-    "options": {
-      "sourceName": "cockroachdb",
-      "host": "'"$HOST"'",
-      "port": "'"$PORT"'",
-      "database": "'"$DATABASE"'",
-      "user": "'"$USER"'",
-      "password": "'"$PASSWORD"'",
-      "sslmode": "'"$SSLMODE"'",
-      "schema": "public",
-      "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
-    }
-  }'
-  
-  if [ $? -eq 0 ]; then
-    echo ""
-    echo "✅ SUCCESS: Mode 2 works! Unity Catalog accepts individual parameters."
-  else
-    echo ""
-    echo "❌ FAILED: Both modes failed! Please check error messages above."
-    exit 1
-  fi
+  export CONNECTION_NAME
+  exit 0
 fi
+
+echo ""
+echo "⚠️  Mode 2 failed. Trying Mode 3..."
+echo ""
+
+# Test Mode 3: Individual parameters
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🧪 MODE 3: Using individual parameters (host, port, database, user, password)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+databricks connections create --json '{
+  "name": "'"$CONNECTION_NAME"'",
+  "connection_type": "GENERIC_LAKEFLOW_CONNECT",
+  "options": {
+    "sourceName": "cockroachdb",
+    "host": "'"$HOST"'",
+    "port": "'"$PORT"'",
+    "database": "'"$DATABASE"'",
+    "user": "'"$USER"'",
+    "password": "'"$PASSWORD"'",
+    "sslmode": "'"$SSLMODE"'",
+    "schema": "public",
+    "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
+  }
+}'
+
+if [ $? -eq 0 ]; then
+  echo ""
+  echo "✅ SUCCESS: Mode 3 works! Unity Catalog accepts individual parameters."
+  echo ""
+  echo "📝 Connection name exported as: CONNECTION_NAME=$CONNECTION_NAME"
+  echo "   Use it in the next command: "
+  echo "   ./createpipeline.sh"
+  echo ""
+  export CONNECTION_NAME
+  exit 0
+fi
+
+echo ""
+echo "❌ FAILED: All three modes failed!"
+echo "Please check the error messages above for details."
+exit 1
 
 echo ""
 echo "📝 Connection name exported as: CONNECTION_NAME=$CONNECTION_NAME"

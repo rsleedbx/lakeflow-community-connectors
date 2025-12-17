@@ -48,20 +48,37 @@ class LakeflowConnect:
             print(f"  {key}: {value}")
         print("=" * 80)
         
-        # Try connection_url first (recommended for Unity Catalog)
-        connection_url = options.get("connection_url")
-        if connection_url:
-            print("✓ Using connection_url (single parameter mode)")
-            self._parse_connection_url(connection_url)
-        else:
-            print("✓ Using individual parameters (legacy mode)")
-            # Fall back to individual parameters
+        # Try different parameter modes to discover what Unity Catalog passes
+        
+        # Mode 1: GitHub-style parameters (token + base_url)
+        # This is a diagnostic test: if this works but host/port/etc don't,
+        # it means Unity Catalog has parameter name restrictions
+        token = options.get("token")  # Full URL with credentials
+        base_url = options.get("base_url")  # URL without credentials (for reference)
+        
+        if token:
+            print("✓ Using 'token' parameter (GitHub-style, diagnostic mode)")
+            print(f"  This means Unity Catalog DOES pass 'token' but might NOT pass 'host'/'port'/etc.")
+            self._parse_connection_url(token)
+        # Mode 2: Single connection_url parameter
+        elif options.get("connection_url"):
+            print("✓ Using 'connection_url' parameter (single parameter mode)")
+            self._parse_connection_url(options.get("connection_url"))
+        # Mode 3: Individual database parameters
+        elif options.get("host"):
+            print("✓ Using individual parameters (host, port, database, user, password)")
             self.host = options.get("host")
             self.port = int(options.get("port", "26257"))
             self.database = options.get("database")
             self.user = options.get("user")
             self.password = options.get("password", "")
             self.sslmode = options.get("sslmode", "require")
+        else:
+            print("❌ No recognized connection parameters found!")
+            print(f"   Available keys: {sorted(options.keys())}")
+            self.host = None
+            self.database = None
+            self.user = None
         
         self.schema = options.get("schema", "public")
         
