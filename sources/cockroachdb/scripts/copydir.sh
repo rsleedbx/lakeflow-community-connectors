@@ -1,12 +1,29 @@
 #!/bin/bash
 # Deploy CockroachDB connector to Databricks workspace
-# Usage: ./copydir.sh
+# Usage: ./copydir.sh (from sources/cockroachdb directory)
+#    or: ./sources/cockroachdb/scripts/copydir.sh (from repo root)
 
 # Exit on error
 trap 'trap - ERR; kill -INT $$' ERR
 set -e
 
 SOURCE_NAME="cockroachdb"
+
+# Find repository root (where scripts/merge_python_source.py exists)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+# Verify we found the repo root
+if [ ! -f "$REPO_ROOT/scripts/merge_python_source.py" ]; then
+  echo "❌ Error: Could not find repository root"
+  echo "   Looking for: $REPO_ROOT/scripts/merge_python_source.py"
+  exit 1
+fi
+
+# Change to repository root
+cd "$REPO_ROOT"
+echo "Repository root: $REPO_ROOT"
+echo ""
 
 # Get current username and workspace URL
 USER_NAME=$(databricks current-user me --output json | jq -r '.userName')
