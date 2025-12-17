@@ -85,76 +85,17 @@ try:
 except Exception as e:
     print(f"  ❌ Error reading spark configuration: {e}")
 
-# Read configuration from DLT pipeline configuration
-# DLT can expose config via: environment variables, spark.conf, or both
-print("\n📖 Reading Pipeline Configuration (trying multiple methods):")
+# Read configuration from DLT pipeline configuration (via Spark config)
+# DLT exposes pipeline configuration directly as spark.conf keys (NO prefix needed)
+# This matches the pattern used by nullsource connector
+print("\n📖 Reading Pipeline Configuration:")
 
-connection_name = None
-table_list_str = None
+connection_name = spark.conf.get("connection_name", "cockroachdb_connection")
+table_list_str = spark.conf.get("table_list", "")
 
-# Method 1: Try environment variables
-print("\n  Method 1: Environment Variables")
-for env_key in ['CONNECTION_NAME', 'connection_name', 'DATABRICKS_CONNECTION_NAME']:
-    val = os.environ.get(env_key)
-    if val:
-        connection_name = val
-        print(f"    ✓ Found connection_name: {env_key} = '{val}'")
-        break
-else:
-    print("    ✗ connection_name not found in env vars")
-
-for env_key in ['TABLE_LIST', 'table_list', 'DATABRICKS_TABLE_LIST']:
-    val = os.environ.get(env_key)
-    if val:
-        table_list_str = val
-        print(f"    ✓ Found table_list: {env_key} = '{val}'")
-        break
-else:
-    print("    ✗ table_list not found in env vars")
-
-# Method 2: Try spark.conf with various prefixes
-print("\n  Method 2: Spark Configuration")
-if not connection_name:
-    for spark_key in [
-        "connection_name",
-        "databricks.pipeline.configuration.connection_name",
-        "spark.databricks.pipeline.configuration.connection_name",
-    ]:
-        val = spark.conf.get(spark_key, None)
-        if val:
-            connection_name = val
-            print(f"    ✓ Found connection_name: {spark_key} = '{val}'")
-            break
-    else:
-        print("    ✗ connection_name not found in spark.conf")
-
-if not table_list_str:
-    for spark_key in [
-        "table_list",
-        "databricks.pipeline.configuration.table_list",
-        "spark.databricks.pipeline.configuration.table_list",
-    ]:
-        val = spark.conf.get(spark_key, None)
-        if val:
-            table_list_str = val
-            print(f"    ✓ Found table_list: {spark_key} = '{val}'")
-            break
-    else:
-        print("    ✗ table_list not found in spark.conf")
-
-# Apply defaults if still not found
-if not connection_name:
-    connection_name = "cockroachdb_connection"
-    print(f"\n  ⚠️  Using DEFAULT connection_name: '{connection_name}'")
-
-if not table_list_str:
-    table_list_str = ""
-    print(f"  ⚠️  table_list NOT FOUND - will fail or use default")
-
-print(f"\n📝 Final Configuration Values:")
-print(f"    connection_name: '{connection_name}'")
-print(f"    table_list: '{table_list_str or 'NOT SET'}'")
-print(f"    source_name: '{source_name}'")
+print(f"  ✓ connection_name: '{connection_name}'")
+print(f"  ✓ table_list: '{table_list_str or 'NOT SET'}'")
+print(f"  ✓ source_name: '{source_name}'")
 
 # Validate and parse table list
 if not table_list_str:
