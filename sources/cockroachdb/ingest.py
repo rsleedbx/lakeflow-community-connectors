@@ -36,11 +36,16 @@ from libs.source_loader import get_register_function
 source_name = "cockroachdb"
 
 # Read configuration from DLT pipeline configuration (via Spark config)
-# DLT exposes pipeline configuration as spark.conf, not os.environ
-connection_name = spark.conf.get("connection_name", "cockroachdb_connection")
-table_list_str = spark.conf.get("table_list", "")  # Required: comma-separated list
+# DLT exposes pipeline configuration with the prefix: spark.databricks.pipeline.configuration.
+connection_name = spark.conf.get("spark.databricks.pipeline.configuration.connection_name", "cockroachdb_connection")
+table_list_str = spark.conf.get("spark.databricks.pipeline.configuration.table_list", "")  # Required: comma-separated list
 
 print(f"DLT pipeline configuration - connection_name: {connection_name}, table_list: {table_list_str or 'NOT SET'}")
+
+# Debug: Print all DLT configuration for troubleshooting
+print("All DLT configuration keys:")
+for key in [k for k in spark.conf.getAll() if "databricks.pipeline.configuration" in k[0]]:
+    print(f"  {key[0]}: {key[1]}")
 
 # Validate and parse table list
 if not table_list_str:
