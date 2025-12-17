@@ -3,11 +3,22 @@ set -e
 
 # Usage: ./create_databricks_connection.sh <connection_url> [connection_name]
 # Example: ./create_databricks_connection.sh "postgresql://user:pass@host:port/db?sslmode=require" "my_crdb_connection"
+#
+# To export CONNECTION_NAME for use in subsequent commands:
+#   source ./create_databricks_connection.sh "$URL" && ./createpipeline.sh "$CONNECTION_NAME"
+#
+# Or use command substitution:
+#   CONNECTION_NAME=$(./create_databricks_connection.sh "$URL" | grep "CONNECTION_NAME=" | cut -d'=' -f2)
 
 if [ -z "$1" ]; then
   echo "Error: Connection URL required"
   echo "Usage: $0 <connection_url> [connection_name]"
-  echo "Example: $0 'postgresql://user:pass@host:port/db?sslmode=require' 'my_connection'"
+  echo ""
+  echo "Examples:"
+  echo "  $0 'postgresql://user:pass@host:port/db?sslmode=require' 'my_connection'"
+  echo ""
+  echo "To use the connection name in next command:"
+  echo "  source $0 \"\$URL\" && ./createpipeline.sh \"\$CONNECTION_NAME\""
   exit 1
 fi
 
@@ -99,4 +110,12 @@ else
   echo ""
   echo "✅ Connection '$CONNECTION_NAME' created successfully!"
 fi
+
+echo ""
+echo "📝 Connection name exported as: CONNECTION_NAME=$CONNECTION_NAME"
+echo "   Use it in the next command:"
+echo "   ./createpipeline.sh \$CONNECTION_NAME"
+
+# Export for use in parent shell (if sourced) or subshells
+export CONNECTION_NAME
 
