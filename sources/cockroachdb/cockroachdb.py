@@ -62,22 +62,43 @@ class LakeflowConnect:
         # Schema is always from options (not from connection)
         self.schema = options.get("schema", "public")
         
-        # CRITICAL: Unity Catalog passes connection NAME, not credentials!
-        # We must fetch credentials from Unity Catalog using the connection name
+        # Try different credential modes
         
-        connection_name = options.get("databricks.connection")
+        # Mode 1: GitHub-style (token + base_url)
+        # token = "username:password", base_url = "postgresql://host:port/database?params"
+        # Reconstruct: "postgresql://username:password@host:port/database?params"
+        token = options.get("token")
+        base_url = options.get("base_url")
         
-        if connection_name:
+        if token and base_url:
+            print(f"✓ Using GitHub-style parameters (token + base_url)")
+            print(f"  token: {token.split(':')[0]}:*** (username:password)")
+            print(f"  base_url: {base_url}")
+            print(f"  Reconstructing full connection URL...")
+            
+            # Insert credentials into base_url: postgresql:// + token@ + rest_of_url
+            if base_url.startswith("postgresql://"):
+                full_url = f"postgresql://{token}@{base_url[13:]}"  # Skip "postgresql://"
+                print(f"  Reconstructed URL: postgresql://{token.split(':')[0]}:***@{base_url[13:]}")
+                self._parse_connection_url(full_url)
+            else:
+                print(f"  ❌ Unexpected base_url format: {base_url}")
+                print(f"     Expected to start with 'postgresql://'")
+                raise ValueError(f"Invalid base_url format: {base_url}")
+        
+        # Mode 2: Unity Catalog connection name (fetch credentials via SDK)
+        elif options.get("databricks.connection"):
+            connection_name = options.get("databricks.connection")
             print(f"✓ Found Unity Catalog connection: {connection_name}")
             print(f"  Fetching credentials from Unity Catalog...")
             self._fetch_credentials_from_uc(connection_name, options)
-        # Fallback: Direct credential modes (for local testing without Unity Catalog)
-        elif options.get("token"):
-            print("✓ Using 'token' parameter (direct testing mode)")
-            self._parse_connection_url(options.get("token"))
+        
+        # Mode 3: Direct connection_url (for local testing)
         elif options.get("connection_url"):
             print("✓ Using 'connection_url' parameter (direct testing mode)")
             self._parse_connection_url(options.get("connection_url"))
+        
+        # Mode 4: Individual parameters (for local testing)
         elif options.get("host"):
             print("✓ Using individual parameters (direct testing mode)")
             self.host = options.get("host")
@@ -86,6 +107,7 @@ class LakeflowConnect:
             self.user = options.get("user")
             self.password = options.get("password", "")
             self.sslmode = options.get("sslmode", "require")
+        
         else:
             print("❌ No recognized connection parameters found!")
             print(f"   Available keys: {sorted(options.keys())}")

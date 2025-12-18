@@ -49,7 +49,10 @@ DATABASE=$(echo "$CONNECTION_URL" | sed -n 's|postgresql://[^@]*@[^/]*/\([^?]*\)
 SSLMODE=$(echo "$CONNECTION_URL" | sed -n 's|.*sslmode=\([^&]*\).*|\1|p')
 SSLMODE="${SSLMODE:-require}"
 
-# Base URL without credentials (for reference)
+# Extract credentials (GitHub-style: token = username:password)
+TOKEN="${USER}:${PASSWORD}"
+
+# Base URL without credentials (will be combined with token in connector)
 BASE_URL="postgresql://${HOST}:${PORT}/${DATABASE}?sslmode=${SSLMODE}"
 
 echo "Creating Unity Catalog connection:"
@@ -58,6 +61,10 @@ echo "  Host: $HOST:$PORT"
 echo "  Database: $DATABASE"
 echo "  User: $USER"
 echo "  SSL Mode: $SSLMODE"
+echo ""
+echo "GitHub-style parameters:"
+echo "  token: ${USER}:*** (username:password)"
+echo "  base_url: $BASE_URL"
 echo ""
 
 # Check if connection already exists
@@ -68,15 +75,17 @@ if databricks connections get "$CONNECTION_NAME" &>/dev/null; then
   sleep 2
 fi
 
-# Create connection with BOTH GitHub-style AND individual parameters
-# Unity Catalog will pass whichever format it supports
-echo "Creating connection with combined parameters..."
+# Create connection with GitHub-style parameters + fallback individual params
+# token = username:password (like GitHub PAT)
+# base_url = server URL without credentials
+# Connector will reconstruct: postgresql://token@base_url
+echo "Creating connection..."
 databricks connections create --json '{
   "name": "'"$CONNECTION_NAME"'",
   "connection_type": "GENERIC_LAKEFLOW_CONNECT",
   "options": {
     "sourceName": "cockroachdb",
-    "token": "'"$CONNECTION_URL"'",
+    "token": "'"$TOKEN"'",
     "base_url": "'"$BASE_URL"'",
     "host": "'"$HOST"'",
     "port": "'"$PORT"'",
