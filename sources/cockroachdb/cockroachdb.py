@@ -7,8 +7,6 @@ from pyspark.sql.types import (
     DoubleType, BooleanType, DateType, TimestampType, BinaryType,
     DecimalType, ArrayType
 )
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.core import Config
 
 
 class LakeflowConnect:
@@ -86,19 +84,12 @@ class LakeflowConnect:
                 print(f"     Expected to start with 'postgresql://'")
                 raise ValueError(f"Invalid base_url format: {base_url}")
         
-        # Mode 2: Unity Catalog connection name (fetch credentials via SDK)
-        elif options.get("databricks.connection"):
-            connection_name = options.get("databricks.connection")
-            print(f"✓ Found Unity Catalog connection: {connection_name}")
-            print(f"  Fetching credentials from Unity Catalog...")
-            self._fetch_credentials_from_uc(connection_name, options)
-        
-        # Mode 3: Direct connection_url (for local testing)
+        # Mode 2: Direct connection_url (for local testing)
         elif options.get("connection_url"):
             print("✓ Using 'connection_url' parameter (direct testing mode)")
             self._parse_connection_url(options.get("connection_url"))
         
-        # Mode 4: Individual parameters (for local testing)
+        # Mode 3: Individual parameters (for local testing)
         elif options.get("host"):
             print("✓ Using individual parameters (direct testing mode)")
             self.host = options.get("host")
@@ -114,102 +105,6 @@ class LakeflowConnect:
             self.host = None
             self.database = None
             self.user = None
-    
-    def _fetch_credentials_from_uc(self, connection_name: str, options: Dict[str, str]) -> None:
-        """
-        Fetch connection credentials from Unity Catalog.
-        
-        Unity Catalog stores credentials securely. We fetch them using Databricks SDK.
-        
-        NOTE: This might not work from Spark workers! Unity Catalog might inject
-        credentials differently. This is experimental.
-        """
-        print(f"  Attempting to fetch credentials for: {connection_name}")
-        print(f"  Method: Using Databricks SDK WorkspaceClient()")
-        
-        try:
-            # Initialize Databricks SDK client
-            # It will use the same authentication as the Databricks CLI/environment
-            print(f"  Step 1: Creating WorkspaceClient()...")
-            w = WorkspaceClient()
-            print(f"  ✅ WorkspaceClient created successfully")
-            
-            print(f"  Step 2: Calling w.connections.get('{connection_name}')...")
-            connection = w.connections.get(connection_name)
-            print(f"  ✅ Connection retrieved successfully")
-            
-            print(f"  Step 3: Examining connection details...")
-            print(f"    Connection type: {connection.connection_type}")
-            print(f"    Connection ID: {connection.connection_id}")
-            print(f"    Connection name: {connection.name}")
-            
-            # Extract credentials from connection options
-            conn_opts = connection.options or {}
-            print(f"    Connection options available: {list(conn_opts.keys()) if conn_opts else '(none)'}")
-            print(f"    Connection options (full): {conn_opts}")
-            
-            # Try token-based connection (GitHub-style)
-            if "token" in conn_opts:
-                print(f"  ✅ Found 'token' parameter, parsing as connection URL")
-                self._parse_connection_url(conn_opts["token"])
-                return
-            
-            # Try connection_url
-            if "connection_url" in conn_opts:
-                print(f"  ✅ Found 'connection_url' parameter")
-                self._parse_connection_url(conn_opts["connection_url"])
-                return
-            
-            # Try individual parameters
-            if "host" in conn_opts:
-                print(f"  ✅ Found individual database parameters")
-                self.host = conn_opts.get("host")
-                self.port = int(conn_opts.get("port", "26257"))
-                self.database = conn_opts.get("database")
-                self.user = conn_opts.get("user")
-                self.password = conn_opts.get("password", "")
-                self.sslmode = conn_opts.get("sslmode", "require")
-                return
-            
-            # No credentials found
-            print(f"  ❌ No credentials found in Unity Catalog connection!")
-            print(f"     Unity Catalog returned only: {sorted(conn_opts.keys())}")
-            print(f"     This means credentials are stored but NOT returned by the API")
-            print(f"     (This is expected for security - credentials are hidden)")
-            print(f"")
-            print(f"  💡 HYPOTHESIS: Unity Catalog should inject credentials into Spark options")
-            print(f"     But we only see: {sorted(options.keys())}")
-            print(f"     Missing: token, connection_url, host, port, database, user, password")
-            self.host = None
-            self.database = None
-            self.user = None
-            
-        except Exception as e:
-            import traceback
-            print(f"  ❌ Failed to fetch credentials from Unity Catalog!")
-            print(f"     Error: {type(e).__name__}: {e}")
-            print(f"     Full traceback:")
-            traceback.print_exc()
-            print(f"")
-            print(f"  💡 This might mean:")
-            print(f"     1. WorkspaceClient doesn't work from Spark workers")
-            print(f"     2. Authentication context is not available")
-            print(f"     3. Unity Catalog uses a different credential injection mechanism")
-            self.host = None
-            self.database = None
-            self.user = None
-        
-        # Validate required parameters (password can be empty)
-        if not all([self.host, self.database, self.user is not None]):
-            print("\n❌ ERROR: Missing required connection parameters!")
-            print(f"  host: {self.host}")
-            print(f"  database: {self.database}")
-            print(f"  user: {self.user}")
-            print(f"\nPossible causes:")
-            print(f"  1. Unity Catalog is not passing individual parameters (host, port, etc.)")
-            print(f"  2. Try using 'connection_url' parameter instead (single string)")
-            print(f"     Format: postgresql://user:password@host:port/database?sslmode=require")
-            raise ValueError("Missing required connection parameters: host, database, user")
     
     def _parse_connection_url(self, url: str) -> None:
         """Parse PostgreSQL connection URL into individual components."""
