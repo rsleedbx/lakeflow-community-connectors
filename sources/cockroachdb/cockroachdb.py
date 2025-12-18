@@ -18,11 +18,13 @@ class LakeflowConnect:
         
         Supports two connection modes:
         
-        1. Connection URL (recommended - single parameter like other connectors):
-            - connection_url: PostgreSQL connection string
-              Format: postgresql://user:password@host:port/database?sslmode=require
+        1. GitHub-style (recommended - works with Unity Catalog):
+            - token: Username and password as "username:password"
+            - base_url: Server URL without credentials
+              Format: postgresql://host:port/database?sslmode=require
+            Connector reconstructs: postgresql://username:password@host:port/database?sslmode=require
         
-        2. Individual parameters (legacy - may not work with Unity Catalog):
+        2. Individual parameters (for local testing only):
             - host: CockroachDB host
             - port: CockroachDB port (default: 26257)
             - database: Database name
@@ -51,9 +53,8 @@ class LakeflowConnect:
             print(f"  {key}: {value}")
         print("=" * 80)
         print(f"\nLooking for credentials in options...")
-        print(f"  Has 'databricks.connection'? {('databricks.connection' in options)}")
         print(f"  Has 'token'? {('token' in options)}")
-        print(f"  Has 'connection_url'? {('connection_url' in options)}")
+        print(f"  Has 'base_url'? {('base_url' in options)}")
         print(f"  Has 'host'? {('host' in options)}")
         print("=" * 80)
         
@@ -65,11 +66,12 @@ class LakeflowConnect:
         # Mode 1: GitHub-style (token + base_url)
         # token = "username:password", base_url = "postgresql://host:port/database?params"
         # Reconstruct: "postgresql://username:password@host:port/database?params"
+        # This is the PRIMARY mode that works with Unity Catalog
         token = options.get("token")
         base_url = options.get("base_url")
         
         if token and base_url:
-            print(f"✓ Using GitHub-style parameters (token + base_url)")
+            print(f"✓ Mode 1: GitHub-style parameters (token + base_url)")
             print(f"  token: {token.split(':')[0]}:*** (username:password)")
             print(f"  base_url: {base_url}")
             print(f"  Reconstructing full connection URL...")
@@ -84,23 +86,22 @@ class LakeflowConnect:
                 print(f"     Expected to start with 'postgresql://'")
                 raise ValueError(f"Invalid base_url format: {base_url}")
         
-        # Mode 2: Direct connection_url (for local testing)
-        elif options.get("connection_url"):
-            print("✓ Using 'connection_url' parameter (direct testing mode)")
-            self._parse_connection_url(options.get("connection_url"))
-        
-        # Mode 3: Individual parameters (for local testing)
+        # Mode 2: Individual parameters (for local testing only)
         elif options.get("host"):
-            print("✓ Using individual parameters (direct testing mode)")
+            print("✓ Mode 2: Individual parameters (local testing mode)")
             self.host = options.get("host")
             self.port = int(options.get("port", "26257"))
             self.database = options.get("database")
             self.user = options.get("user")
             self.password = options.get("password", "")
             self.sslmode = options.get("sslmode", "require")
+            self._init_connection()
         
         else:
             print("❌ No recognized connection parameters found!")
+            print(f"   Expected either:")
+            print(f"     - Mode 1: 'token' + 'base_url' (Unity Catalog)")
+            print(f"     - Mode 2: 'host', 'port', 'database', 'user', 'password' (local testing)")
             print(f"   Available keys: {sorted(options.keys())}")
             self.host = None
             self.database = None
