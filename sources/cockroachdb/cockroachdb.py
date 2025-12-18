@@ -43,11 +43,11 @@ class LakeflowConnect:
         print(f"  Total options: {len(options)}")
         print(f"\nALL OPTIONS (raw dump - this is what Spark passes to the connector):")
         for key in sorted(options.keys()):
-            # Mask ONLY passwords for security
-            if "password" in key.lower():
+            # Mask sensitive fields for security
+            if any(sensitive in key.lower() for sensitive in ["password", "token"]):
                 value = "***REDACTED***"
             else:
-                # Show everything else, even if potentially sensitive
+                # Show everything else
                 # This is for debugging - we need to see what UC actually passes
                 value = repr(options[key])  # Use repr to show exact type/value
             print(f"  {key}: {value}")
