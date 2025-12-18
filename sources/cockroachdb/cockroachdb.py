@@ -39,9 +39,9 @@ class LakeflowConnect:
         print("=" * 80)
         print("🔍 DEBUG: CockroachDB Connector __init__ called")
         print("=" * 80)
-        print(f"Options received from Unity Catalog connection:")
+        print(f"Options received from Spark/Unity Catalog:")
         print(f"  Total options: {len(options)}")
-        print(f"\nALL OPTIONS (raw dump):")
+        print(f"\nALL OPTIONS (raw dump - this is what Spark passes to the connector):")
         for key in sorted(options.keys()):
             # Mask ONLY passwords for security
             if "password" in key.lower():
@@ -49,8 +49,14 @@ class LakeflowConnect:
             else:
                 # Show everything else, even if potentially sensitive
                 # This is for debugging - we need to see what UC actually passes
-                value = options[key]
+                value = repr(options[key])  # Use repr to show exact type/value
             print(f"  {key}: {value}")
+        print("=" * 80)
+        print(f"\nLooking for credentials in options...")
+        print(f"  Has 'databricks.connection'? {('databricks.connection' in options)}")
+        print(f"  Has 'token'? {('token' in options)}")
+        print(f"  Has 'connection_url'? {('connection_url' in options)}")
+        print(f"  Has 'host'? {('host' in options)}")
         print("=" * 80)
         
         # Schema is always from options (not from connection)
@@ -92,20 +98,33 @@ class LakeflowConnect:
         Fetch connection credentials from Unity Catalog.
         
         Unity Catalog stores credentials securely. We fetch them using Databricks SDK.
+        
+        NOTE: This might not work from Spark workers! Unity Catalog might inject
+        credentials differently. This is experimental.
         """
+        print(f"  Attempting to fetch credentials for: {connection_name}")
+        print(f"  Method: Using Databricks SDK WorkspaceClient()")
+        
         try:
             # Initialize Databricks SDK client
             # It will use the same authentication as the Databricks CLI/environment
+            print(f"  Step 1: Creating WorkspaceClient()...")
             w = WorkspaceClient()
+            print(f"  ✅ WorkspaceClient created successfully")
             
-            print(f"  Fetching connection details...")
+            print(f"  Step 2: Calling w.connections.get('{connection_name}')...")
             connection = w.connections.get(connection_name)
+            print(f"  ✅ Connection retrieved successfully")
             
-            print(f"  Connection type: {connection.connection_type}")
-            print(f"  Connection options available: {list(connection.options.keys()) if connection.options else []}")
+            print(f"  Step 3: Examining connection details...")
+            print(f"    Connection type: {connection.connection_type}")
+            print(f"    Connection ID: {connection.connection_id}")
+            print(f"    Connection name: {connection.name}")
             
             # Extract credentials from connection options
             conn_opts = connection.options or {}
+            print(f"    Connection options available: {list(conn_opts.keys()) if conn_opts else '(none)'}")
+            print(f"    Connection options (full): {conn_opts}")
             
             # Try token-based connection (GitHub-style)
             if "token" in conn_opts:
@@ -132,14 +151,28 @@ class LakeflowConnect:
             
             # No credentials found
             print(f"  ❌ No credentials found in Unity Catalog connection!")
-            print(f"     Available options: {sorted(conn_opts.keys())}")
+            print(f"     Unity Catalog returned only: {sorted(conn_opts.keys())}")
+            print(f"     This means credentials are stored but NOT returned by the API")
+            print(f"     (This is expected for security - credentials are hidden)")
+            print(f"")
+            print(f"  💡 HYPOTHESIS: Unity Catalog should inject credentials into Spark options")
+            print(f"     But we only see: {sorted(options.keys())}")
+            print(f"     Missing: token, connection_url, host, port, database, user, password")
             self.host = None
             self.database = None
             self.user = None
             
         except Exception as e:
-            print(f"  ❌ Failed to fetch credentials from Unity Catalog: {e}")
-            print(f"     This might be a permissions issue or SDK configuration problem")
+            import traceback
+            print(f"  ❌ Failed to fetch credentials from Unity Catalog!")
+            print(f"     Error: {type(e).__name__}: {e}")
+            print(f"     Full traceback:")
+            traceback.print_exc()
+            print(f"")
+            print(f"  💡 This might mean:")
+            print(f"     1. WorkspaceClient doesn't work from Spark workers")
+            print(f"     2. Authentication context is not available")
+            print(f"     3. Unity Catalog uses a different credential injection mechanism")
             self.host = None
             self.database = None
             self.user = None
