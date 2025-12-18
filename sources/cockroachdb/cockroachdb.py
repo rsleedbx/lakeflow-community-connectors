@@ -541,13 +541,6 @@ class LakeflowConnect:
         
         changefeed_query = f"EXPERIMENTAL CHANGEFEED FOR {target} WITH {options_str}"
         
-        # Debug logging (can be disabled in production)
-        import os
-        if os.getenv("DEBUG_CHANGEFEED"):
-            print(f"[DEBUG] Changefeed query: {changefeed_query}")
-            print(f"[DEBUG] Batch size: {batch_size}")
-            print(f"[DEBUG] Start offset: {start_offset}")
-        
         # Execute changefeed
         self._ensure_connection()
         
