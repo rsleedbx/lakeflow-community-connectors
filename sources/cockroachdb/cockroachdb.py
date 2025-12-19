@@ -1,16 +1,24 @@
 from typing import Dict, List, Iterator, Any
 import json
-import psycopg2
-import psycopg2.extras
+import os
+import ssl
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, IntegerType,
     DoubleType, BooleanType, DateType, TimestampType, BinaryType,
     DecimalType, ArrayType
 )
 
+# NOTE: Do NOT import pg8000 or psycopg2 at module level!
+# They must be imported lazily inside _get_connection() to avoid Spark serialization issues
+# pg8000 is installed at runtime in ingest.py, so it won't be available during module serialization
+
 
 class LakeflowConnect:
     """CockroachDB connector using sinkless changefeeds for CDC."""
+    
+    # Class variable to share snapshot timestamp across tables in multi-table pipelines
+    # This ensures all tables use the same timestamp for snapshot consistency
+    _shared_snapshot_timestamp = None
     
     def __init__(self, options: Dict[str, str]) -> None:
         """
@@ -33,7 +41,8 @@ class LakeflowConnect:
             - sslmode: SSL mode (default: 'require')
             - schema: Schema name (default: 'public')
         """
-        self.conn = None  # Initialize conn first for __del__
+        # Note: We do NOT create a connection in __init__ to avoid Spark serialization issues
+        # Connection will be created lazily in methods that need it
         
         # Debug: Print what options we actually receive from Unity Catalog
         print("=" * 80)
@@ -47,9 +56,7 @@ class LakeflowConnect:
             if any(sensitive in key.lower() for sensitive in ["password", "token"]):
                 value = "***REDACTED***"
             else:
-                # Show everything else
-                # This is for debugging - we need to see what UC actually passes
-                value = repr(options[key])  # Use repr to show exact type/value
+                value = repr(options[key])
             print(f"  {key}: {value}")
         print("=" * 80)
         print(f"\nLooking for credentials in options...")
@@ -58,15 +65,10 @@ class LakeflowConnect:
         print(f"  Has 'host'? {('host' in options)}")
         print("=" * 80)
         
-        # Schema is always from options (not from connection)
+        # Schema from connection (fixed by Unity Catalog)
         self.schema = options.get("schema", "public")
         
         # Try different credential modes
-        
-        # Mode 1: GitHub-style (token + base_url)
-        # token = "username:password", base_url = "postgresql://host:port/database?params"
-        # Reconstruct: "postgresql://username:password@host:port/database?params"
-        # This is the PRIMARY mode that works with Unity Catalog
         token = options.get("token")
         base_url = options.get("base_url")
         
@@ -76,17 +78,14 @@ class LakeflowConnect:
             print(f"  base_url: {base_url}")
             print(f"  Reconstructing full connection URL...")
             
-            # Insert credentials into base_url: postgresql:// + token@ + rest_of_url
             if base_url.startswith("postgresql://"):
-                full_url = f"postgresql://{token}@{base_url[13:]}"  # Skip "postgresql://"
+                full_url = f"postgresql://{token}@{base_url[13:]}"
                 print(f"  Reconstructed URL: postgresql://{token.split(':')[0]}:***@{base_url[13:]}")
                 self._parse_connection_url(full_url)
             else:
                 print(f"  ❌ Unexpected base_url format: {base_url}")
-                print(f"     Expected to start with 'postgresql://'")
                 raise ValueError(f"Invalid base_url format: {base_url}")
         
-        # Mode 2: Individual parameters (for local testing only)
         elif options.get("host"):
             print("✓ Mode 2: Individual parameters (local testing mode)")
             self.host = options.get("host")
@@ -95,24 +94,20 @@ class LakeflowConnect:
             self.user = options.get("user")
             self.password = options.get("password", "")
             self.sslmode = options.get("sslmode", "require")
-            self._init_connection()
         
         else:
             print("❌ No recognized connection parameters found!")
-            print(f"   Expected either:")
-            print(f"     - Mode 1: 'token' + 'base_url' (Unity Catalog)")
-            print(f"     - Mode 2: 'host', 'port', 'database', 'user', 'password' (local testing)")
-            print(f"   Available keys: {sorted(options.keys())}")
             self.host = None
             self.database = None
             self.user = None
+        
+        print(f"  Note: Connection will be created lazily when needed (not in __init__)")
     
     def _parse_connection_url(self, url: str) -> None:
         """Parse PostgreSQL connection URL into individual components."""
         import re
         from urllib.parse import urlparse, parse_qs
         
-        # Parse URL: postgresql://user:password@host:port/database?params
         parsed = urlparse(url)
         
         self.user = parsed.username
@@ -121,7 +116,6 @@ class LakeflowConnect:
         self.port = parsed.port or 26257
         self.database = parsed.path.lstrip("/").split("?")[0]
         
-        # Parse query parameters
         query_params = parse_qs(parsed.query)
         self.sslmode = query_params.get("sslmode", ["require"])[0]
         
@@ -132,370 +126,323 @@ class LakeflowConnect:
         print(f"    user: {self.user}")
         print(f"    password: {'***' if self.password else '(empty)'}")
         print(f"    sslmode: {self.sslmode}")
-        
-        self._init_connection()
     
-    def _init_connection(self) -> None:
-        """Initialize connection to CockroachDB."""
+    def _get_connection(self, table_options: Dict[str, str] = None):
+        """Create and return a new connection to CockroachDB."""
         try:
-            self.conn = psycopg2.connect(
+            # LAZY IMPORT: Import drivers here (not at module level)
+            import pg8000
+            
+            print(f"\n🔍 DEBUG: Creating connection using pg8000...")
+            print(f"  host={self.host}, port={self.port}, database={self.database}")
+            
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            conn = pg8000.connect(
+                user=self.user,
+                password=self.password,
                 host=self.host,
                 port=self.port,
                 database=self.database,
-                user=self.user,
-                password=self.password,
-                sslmode=self.sslmode
+                ssl_context=ssl_context
             )
-            self.conn.set_session(autocommit=True)
+            
+            print("✅ Connected using pg8000 (pure Python driver)")
+            return conn
+                    
         except Exception as e:
             raise ConnectionError(f"Failed to connect to CockroachDB: {str(e)}")
     
-    def _ensure_connection(self) -> None:
-        """Ensure connection is alive, reconnect if needed."""
+    def _execute_query(self, conn, query: str, params: tuple = None):
+        """Execute a query with driver-agnostic API."""
+        with conn.cursor() as cur:
+            if params:
+                cur.execute(query, params)
+            else:
+                cur.execute(query)
+            return cur.fetchall()
+    
+    def _create_cursor(self, conn):
+        """Create a cursor with driver-agnostic API."""
+        return conn.cursor()
+    
+    def list_tables(self, table_options: Dict[str, str] = None) -> List[str]:
+        """List all tables in the specified schema."""
+        conn = self._get_connection(table_options)
         try:
-            if self.conn is None or self.conn.closed:
-                self._init_connection()
-        except Exception:
-            self._init_connection()
+            query = """
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = %s
+                  AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """
+            rows = self._execute_query(conn, query, (self.schema,))
+            return [row[0] for row in rows]
+        finally:
+            conn.close()
     
-    def list_tables(self) -> List[str]:
-        """
-        List all tables in the specified schema.
-        
-        Returns:
-            List of table names
-        """
-        self._ensure_connection()
-        
-        query = """
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = %s
-              AND table_type = 'BASE TABLE'
-            ORDER BY table_name
-        """
-        
-        with self.conn.cursor() as cur:
-            cur.execute(query, (self.schema,))
-            tables = [row[0] for row in cur.fetchall()]
-        
-        return tables
-    
-    def get_table_schema(
-        self, table_name: str, table_options: Dict[str, str]
-    ) -> StructType:
-        """
-        Get the Spark schema for a CockroachDB table.
-        
-        Args:
-            table_name: Name of the table
-            table_options: Additional options (not used currently)
-        
-        Returns:
-            StructType representing the table schema
-        """
-        # Validate table exists
-        if table_name not in self.list_tables():
+    def get_table_schema(self, table_name: str, table_options: Dict[str, str] = None) -> StructType:
+        """Get the Spark schema for a given table."""
+        if table_name not in self.list_tables(table_options):
             raise ValueError(f"Table '{table_name}' not found in schema '{self.schema}'")
         
-        self._ensure_connection()
-        
-        query = """
-            SELECT 
-                column_name,
-                data_type,
-                character_maximum_length,
-                numeric_precision,
-                numeric_scale,
-                is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = %s 
-              AND table_name = %s
-            ORDER BY ordinal_position
-        """
-        
-        with self.conn.cursor() as cur:
-            cur.execute(query, (self.schema, table_name))
-            columns = cur.fetchall()
-        
-        fields = []
-        for col in columns:
-            col_name, data_type, char_max_len, num_precision, num_scale, is_nullable = col
-            nullable = (is_nullable == 'YES')
-            spark_type = self._map_cockroachdb_type_to_spark(
-                data_type, char_max_len, num_precision, num_scale
-            )
-            fields.append(StructField(col_name, spark_type, nullable))
-        
-        # Add CDC metadata fields (connector-added, not in source database)
-        # These are derived from CockroachDB's native changefeed columns:
-        #   - CockroachDB returns: (key, value, updated, topic)
-        #   - Connector adds: _cdc_key, _cdc_updated, _cdc_operation
-        # This follows Lakeflow CDC conventions for Delta Lake integration
-        fields.append(StructField("_cdc_key", ArrayType(StringType()), True))      # Mapped from changefeed 'key' column
-        fields.append(StructField("_cdc_updated", StringType(), True))             # Mapped from changefeed 'updated' column
-        fields.append(StructField("_cdc_operation", StringType(), True))           # Derived from changefeed 'value' column
-        
-        return StructType(fields)
+        conn = self._get_connection(table_options)
+        try:
+            query = """
+                SELECT 
+                    column_name,
+                    data_type,
+                    character_maximum_length,
+                    numeric_precision,
+                    numeric_scale,
+                    is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = %s 
+                  AND table_name = %s
+                ORDER BY ordinal_position
+            """
+            
+            columns = self._execute_query(conn, query, (self.schema, table_name))
+            
+            fields = []
+            for col in columns:
+                col_name, data_type, char_max_len, num_precision, num_scale, is_nullable = col
+                nullable = True  # Always nullable for CDC
+                spark_type = self._map_cockroachdb_type_to_spark(
+                    data_type, char_max_len, num_precision, num_scale
+                )
+                fields.append(StructField(col_name, spark_type, nullable))
+            
+            # Add CDC metadata fields
+            fields.append(StructField("_cdc_key", ArrayType(StringType()), True))
+            fields.append(StructField("_cdc_updated", StringType(), True))
+            fields.append(StructField("_cdc_operation", StringType(), True))
+            
+            return StructType(fields)
+        finally:
+            conn.close()
     
     def _map_cockroachdb_type_to_spark(
         self, data_type: str, char_max_len: int, num_precision: int, num_scale: int
     ) -> Any:
-        """Map CockroachDB/PostgreSQL types to Spark types."""
-        data_type_lower = data_type.lower()
-        
-        # Integer types
-        if data_type_lower in ('bigint', 'int8', 'serial', 'bigserial'):
+        """Map CockroachDB data types to Spark SQL data types."""
+        data_type = data_type.lower()
+        if data_type in ("uuid", "string", "varchar", "text", "char", "character"):
+            return StringType()
+        elif data_type in ("int", "integer", "smallint", "bigint"):
             return LongType()
-        elif data_type_lower in ('integer', 'int', 'int4', 'int2', 'smallint'):
-            return LongType()  # Prefer LongType over IntegerType
-        
-        # Floating point types
-        elif data_type_lower in ('double precision', 'float8', 'float', 'real', 'float4'):
+        elif data_type in ("float", "double precision"):
             return DoubleType()
-        
-        # Decimal types
-        elif data_type_lower in ('numeric', 'decimal'):
-            if num_precision and num_scale is not None:
-                return DecimalType(num_precision, num_scale)
-            else:
-                return DecimalType(38, 18)  # Default precision
-        
-        # Boolean
-        elif data_type_lower in ('boolean', 'bool'):
+        elif data_type == "boolean":
             return BooleanType()
-        
-        # String types
-        elif data_type_lower in ('character varying', 'varchar', 'character', 'char', 'text', 'string'):
-            return StringType()
-        
-        # Binary types
-        elif data_type_lower in ('bytea', 'bytes'):
-            return BinaryType()
-        
-        # Date and time types
-        elif data_type_lower == 'date':
+        elif data_type == "date":
             return DateType()
-        elif data_type_lower in ('timestamp without time zone', 'timestamp'):
+        elif data_type in ("timestamp", "timestamptz"):
             return TimestampType()
-        elif data_type_lower in ('timestamp with time zone', 'timestamptz'):
-            return TimestampType()
-        elif data_type_lower in ('time', 'time without time zone', 'time with time zone'):
-            return StringType()  # Represent time as string
-        elif data_type_lower == 'interval':
+        elif data_type == "bytes":
+            return BinaryType()
+        elif data_type == "decimal" or data_type == "numeric":
+            if num_precision is not None and num_scale is not None:
+                return DecimalType(num_precision, num_scale)
+            return DecimalType(38, 18)
+        elif data_type == "jsonb":
             return StringType()
-        
-        # UUID
-        elif data_type_lower == 'uuid':
-            return StringType()
-        
-        # Network types
-        elif data_type_lower in ('inet', 'cidr', 'macaddr'):
-            return StringType()
-        
-        # JSON types
-        elif data_type_lower in ('json', 'jsonb'):
-            return StringType()  # Store JSON as string
-        
-        # Array types
-        elif data_type_lower == 'ARRAY':
-            return ArrayType(StringType())  # Default to string array
-        
-        # Default fallback
         else:
+            print(f"⚠️  Warning: Unknown CockroachDB type '{data_type}', mapping to StringType.")
             return StringType()
     
     def read_table_metadata(
         self, table_name: str, table_options: Dict[str, str]
     ) -> Dict[str, Any]:
-        """
-        Get metadata for a table.
-        
-        Args:
-            table_name: Name of the table
-            table_options: Additional options (not used currently)
-        
-        Returns:
-            Dictionary with metadata:
-                - primary_keys: List of primary key column names
-                - cursor_field: Field to use for cursor (_cdc_updated)
-                - ingestion_type: Always 'cdc' for changefeeds
-        """
-        # Validate table exists
-        if table_name not in self.list_tables():
+        """Read table metadata."""
+        if table_name not in self.list_tables(table_options):
             raise ValueError(f"Table '{table_name}' not found in schema '{self.schema}'")
         
-        self._ensure_connection()
-        
-        # Get primary key columns
-        pk_query = """
-            SELECT kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu 
-              ON tc.constraint_name = kcu.constraint_name
-              AND tc.table_schema = kcu.table_schema
-              AND tc.table_name = kcu.table_name
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-              AND tc.table_schema = %s
-              AND tc.table_name = %s
-            ORDER BY kcu.ordinal_position
-        """
-        
-        with self.conn.cursor() as cur:
-            cur.execute(pk_query, (self.schema, table_name))
-            pk_columns = [row[0] for row in cur.fetchall()]
-        
-        if not pk_columns:
-            raise ValueError(f"Table '{table_name}' has no primary key. CockroachDB changefeeds require a primary key.")
-        
-        return {
-            "primary_keys": pk_columns,
-            "cursor_field": "_cdc_updated",  # Use CDC timestamp as cursor
-            "ingestion_type": "cdc"  # All CockroachDB tables support CDC via changefeeds
-        }
+        conn = self._get_connection(table_options)
+        try:
+            pk_query = """
+                SELECT kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu 
+                  ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema = kcu.table_schema
+                  AND tc.table_name = kcu.table_name
+                WHERE tc.constraint_type = 'PRIMARY KEY'
+                  AND tc.table_schema = %s
+                  AND tc.table_name = %s
+                ORDER BY kcu.ordinal_position
+            """
+            
+            rows = self._execute_query(conn, pk_query, (self.schema, table_name))
+            pk_columns = [row[0] for row in rows]
+            
+            if not pk_columns:
+                raise ValueError(f"Table '{table_name}' has no primary key.")
+            
+            return {
+                "primary_keys": pk_columns,
+                "cursor_field": "_cdc_updated",
+                "ingestion_type": "cdc"
+            }
+        finally:
+            conn.close()
     
     def read_table(
-        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
-    ) -> (Iterator[Dict], Dict):
-        """
-        Read table data using CockroachDB changefeed.
+        self, table_name: str, start_offset: Dict[str, str], table_options: Dict[str, str]
+    ) -> Iterator[Dict[str, Any]]:
+        """Read data from a CockroachDB table using changefeeds."""
+        import time
         
-        Args:
-            table_name: Name of the table
-            start_offset: Starting cursor position (timestamp)
-            table_options: Additional options:
-                - cursor: Resume cursor (CockroachDB timestamp)
-                - include_diff: Include before/after values (boolean)
-                - select_query: Custom SELECT for filtered changefeed
-                - resolved_interval: Resolved timestamp interval (default: '10s')
-                - batch_size: Number of events to read before returning (default: 1000)
+        if table_name not in self.list_tables(table_options):
+            raise ValueError(f"Table '{table_name}' not found")
         
-        Returns:
-            Iterator of change events and end offset
-        """
-        # Validate table exists
-        if table_name not in self.list_tables():
-            raise ValueError(f"Table '{table_name}' not found in schema '{self.schema}'")
-        
-        # Parse options
         cursor = start_offset.get("cursor") if start_offset else None
-        include_diff = table_options.get("include_diff", "false").lower() == "true"
-        select_query = table_options.get("select_query")
-        resolved_interval = table_options.get("resolved_interval", "10s")
-        batch_size = int(table_options.get("batch_size", "1000"))
+        resolved_interval = table_options.get("resolved_interval", "1s")
         
-        # Override cursor from table_options if provided
-        if table_options.get("cursor"):
-            cursor = table_options.get("cursor")
+        # Determine changefeed mode
+        initial_scan_config = table_options.get("initial_scan", "only")
         
-        # Build changefeed query
+        if initial_scan_config.lower() == "no":
+            effective_initial_scan = "no"
+        elif cursor:
+            effective_initial_scan = "no"
+        else:
+            effective_initial_scan = initial_scan_config
+        
         changefeed_options = []
         
-        # Include initial scan (existing rows) if requested
-        # 'only' = return existing rows then stop (batch mode - no streaming options)
-        # 'yes' = return existing rows then stream new changes (CDC mode - includes streaming options)
-        initial_scan = table_options.get("initial_scan", "only")  # Default to 'only' for faster testing
-        
-        if initial_scan.lower() == "only":
-            # Batch/snapshot mode: initial_scan='only' cannot be combined with updated/resolved
+        if effective_initial_scan.lower() == "only":
             changefeed_options.append(f"initial_scan='only'")
-            # Don't add 'updated' or 'resolved' - they're incompatible with initial_scan='only'
-        elif initial_scan.lower() == "yes":
-            # Streaming CDC mode: include streaming options
+        elif effective_initial_scan.lower() == "yes":
             changefeed_options.append(f"initial_scan='yes'")
-            changefeed_options.append("updated")  # Include timestamps
+            changefeed_options.append("updated")
             changefeed_options.append(f"resolved='{resolved_interval}'")
         else:
-            # Default streaming mode (no initial_scan specified)
-            changefeed_options.append("updated")  # Include timestamps
+            changefeed_options.append("initial_scan='no'")
+            changefeed_options.append("updated")
             changefeed_options.append(f"resolved='{resolved_interval}'")
         
-        if include_diff:
-            changefeed_options.append("diff")
+        changefeed_options.append("split_column_families")
         
-        # Add split_column_families for tables with multiple column families
-        # This is required for some tables (like YCSB usertable)
-        split_families = table_options.get("split_column_families", "true")
-        if split_families.lower() == "true":
-            changefeed_options.append("split_column_families")
-        
-        if cursor:
+        if cursor and effective_initial_scan.lower() != "only":
             changefeed_options.append(f"cursor='{cursor}'")
         
         options_str = ", ".join(changefeed_options)
-        
-        # Determine changefeed target
-        if select_query:
-            # Use CDC query (filtered changefeed)
-            target = f"({select_query})"
-        else:
-            # Use table name
-            if self.schema != 'public':
-                target = f"{self.schema}.{table_name}"
-            else:
-                target = table_name
-        
+        target = f"{self.schema}.{table_name}" if self.schema != 'public' else table_name
         changefeed_query = f"EXPERIMENTAL CHANGEFEED FOR {target} WITH {options_str}"
         
-        # Execute changefeed
-        self._ensure_connection()
+        conn = self._get_connection(table_options)
+        
+        # Capture timestamp for multi-table consistency
+        if effective_initial_scan.lower() == "only":
+            is_multi_table = table_options.get("multi_table_pipeline", "false").lower() == "true"
+            
+            debug_cursor = self._create_cursor(conn)
+            debug_cursor.execute("SELECT cluster_logical_timestamp()::string")
+            current_ts = debug_cursor.fetchone()[0]
+            debug_cursor.close()
+            
+            if is_multi_table and LakeflowConnect._shared_snapshot_timestamp:
+                self._snapshot_start_timestamp = LakeflowConnect._shared_snapshot_timestamp
+                print(f"\n💡 Reusing shared snapshot timestamp: {self._snapshot_start_timestamp}")
+            else:
+                self._snapshot_start_timestamp = current_ts
+                print(f"\n💡 Captured snapshot start timestamp: {current_ts}")
+                if is_multi_table:
+                    LakeflowConnect._shared_snapshot_timestamp = current_ts
         
         def event_generator():
-            """Generator that yields changefeed events.
+            """Generator that yields changefeed events."""
+            query_start = time.time()
             
-            CockroachDB changefeed returns different columns based on options:
-                - Without 'updated': (key, value) - 2 columns
-                - With 'updated': (key, value, updated, topic) - 4 columns
-            """
-            changefeed_cursor = self.conn.cursor()
-            changefeed_cursor.execute(changefeed_query)
+            # Set timeout
+            if cursor and effective_initial_scan.lower() == "no":
+                query_timeout = "5s"
+            else:
+                query_timeout = "600s"
+            
+            changefeed_cursor = self._create_cursor(conn)
+            
+            try:
+                changefeed_cursor.execute(f"SET statement_timeout = '{query_timeout}'")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Could not set statement_timeout: {e}")
+            
+            try:
+                changefeed_cursor.execute(changefeed_query)
+                print(f"✅ Query submitted")
+            except Exception as e:
+                # Check for timeout
+                try:
+                    import pg8000.dbapi
+                    import pg8000.exceptions
+                    is_pg8000_error = isinstance(e, (pg8000.dbapi.ProgrammingError, pg8000.exceptions.DatabaseError))
+                except ImportError:
+                    is_pg8000_error = False
+                
+                error_msg = str(e).lower()
+                error_dict = str(e)
+                is_statement_timeout = (
+                    'statement timeout' in error_msg or
+                    '57014' in error_dict or
+                    isinstance(e, TimeoutError) or
+                    (is_pg8000_error and '57014' in error_dict)
+                )
+                
+                if is_statement_timeout:
+                    print(f"\n✅ Changefeed timed out (EXPECTED - no changes)")
+                    try:
+                        changefeed_cursor.close()
+                    except:
+                        pass
+                    return cursor
+                else:
+                    print(f"\n❌ Unexpected error: {e}")
+                    try:
+                        changefeed_cursor.close()
+                    except:
+                        pass
+                    raise
             
             event_count = 0
             last_resolved = None
-            
-            # Detect if 'updated' option is used (affects result structure)
-            has_updated = initial_scan.lower() != "only"  # 'only' mode doesn't support 'updated'
+            highest_updated = None
+            has_updated = effective_initial_scan.lower() != "only"
             
             try:
                 for row in changefeed_cursor:
                     if has_updated:
-                        # Format with 'updated': (table, key, value, updated, topic)
-                        table_name = row[0]
                         key_json = row[1]
                         value_json = row[2]
                         updated = row[3]
-                        topic = row[4] if len(row) > 4 else None
                         
-                        # Check if this is a resolved timestamp event
+                        if updated:
+                            if highest_updated is None or updated > highest_updated:
+                                highest_updated = updated
+                        
                         if key_json is None and value_json is None:
-                            # Resolved timestamp row - use as watermark
                             last_resolved = updated
+                            if cursor is not None:
+                                print(f"   ✅ Caught up at: {last_resolved}")
+                                break
                             continue
                     else:
-                        # Format without 'updated': (table, key, value)
-                        table_name = row[0]
                         key_json = row[1]
                         value_json = row[2]
-                        updated = None  # No timestamp in initial_scan='only' mode
-                        topic = None
+                        updated = None
                     
-                    # Parse JSON columns (handle None, empty strings, and memoryview objects)
-                    # psycopg2 may return bytea columns as memoryview objects
                     def parse_json_column(json_data):
-                        """Parse JSON from string, bytes, or memoryview."""
                         if json_data is None:
                             return None
-                        
-                        # Convert memoryview or bytes to string
                         if isinstance(json_data, memoryview):
                             json_data = json_data.tobytes().decode('utf-8')
                         elif isinstance(json_data, bytes):
                             json_data = json_data.decode('utf-8')
-                        
-                        # Check for empty or whitespace-only strings
                         if not isinstance(json_data, str) or json_data.strip() == '':
                             return None
-                        
                         try:
                             return json.loads(json_data)
                         except json.JSONDecodeError:
@@ -504,93 +451,92 @@ class LakeflowConnect:
                     key = parse_json_column(key_json) or []
                     value = parse_json_column(value_json)
                     
-                    # Transform to standardized format using native columns
-                    transformed_event = self._transform_changefeed_event_native(
-                        key, value, updated, include_diff
-                    )
+                    transformed_event = self._transform_changefeed_event_native(key, value, updated)
                     yield transformed_event
                     
                     event_count += 1
-                    
-                    # Stop after batch_size events
-                    if event_count >= batch_size:
-                        break
+            except Exception as e:
+                try:
+                    import pg8000.dbapi
+                    import pg8000.exceptions
+                    is_pg8000_error = isinstance(e, (pg8000.dbapi.ProgrammingError, pg8000.exceptions.DatabaseError))
+                except ImportError:
+                    is_pg8000_error = False
+                
+                error_msg = str(e).lower()
+                error_dict = str(e)
+                is_timeout = (
+                    isinstance(e, TimeoutError) or
+                    'timeout' in error_msg or
+                    '57014' in error_dict or
+                    (is_pg8000_error and '57014' in error_dict)
+                )
+                
+                if is_timeout:
+                    print(f"\n⏰ Query timed out (EXPECTED)")
+                else:
+                    print(f"\n❌ Error: {e}")
+                    try:
+                        changefeed_cursor.close()
+                    except:
+                        pass
+                    raise
             finally:
-                changefeed_cursor.close()
+                try:
+                    changefeed_cursor.close()
+                except:
+                    pass
             
-            # Return the last resolved timestamp as the new cursor
-            return last_resolved
+            cursor_to_return = last_resolved or highest_updated
+            return cursor_to_return
         
-        # Create iterator and collect events
         events = []
         last_resolved = None
         
         try:
             gen = event_generator()
             for event in gen:
-                events.append(event)
+                if event is not None:
+                    events.append(event)
         except StopIteration as e:
             last_resolved = e.value if hasattr(e, 'value') else None
+        finally:
+            conn.close()
         
-        # Determine end offset
         end_offset = start_offset.copy() if start_offset else {}
+        
         if last_resolved:
             end_offset["cursor"] = last_resolved
+        elif hasattr(self, '_snapshot_start_timestamp') and self._snapshot_start_timestamp:
+            end_offset["cursor"] = self._snapshot_start_timestamp
+        
+        # Print manual test command
+        if end_offset.get("cursor"):
+            print(f"💡 Manual Test:")
+            print(f"psql $COCKROACHDB_URL << 'EOF'")
+            print(f"EXPERIMENTAL CHANGEFEED FOR {table_name}")
+            print(f"  WITH initial_scan='no', updated, resolved='1s',")
+            print(f"       split_column_families, cursor='{end_offset['cursor']}';")
+            print(f"EOF")
         
         return iter(events), end_offset
     
     def _transform_changefeed_event_native(
-        self, key: list, value: Dict, updated: str, include_diff: bool
+        self, key: list, value: Dict, updated: str
     ) -> Dict:
-        """
-        Transform CockroachDB's native changefeed columns into Lakeflow CDC format.
+        """Transform CockroachDB changefeed event."""
+        result = value.copy() if value else {}
+        result["_cdc_key"] = key
         
-        CockroachDB changefeeds natively return different columns based on options:
-            - Without 'updated' option: (key, value) - 2 columns
-            - With 'updated' option: (key, value, updated, topic) - 4 columns
-        
-        This method maps them to Lakeflow CDC conventions (fields added by connector):
-            - _cdc_key: Mapped from 'key' column
-            - _cdc_updated: Mapped from 'updated' column (or None if not available)
-            - _cdc_operation: Derived from 'value' column content
-        
-        Args:
-            key: Primary key values (from changefeed 'key' column)
-            value: Row data (from changefeed 'value' column)
-            updated: MVCC timestamp (from changefeed 'updated' column, or None for snapshot queries)
-            include_diff: Whether diff (before/after) is included
-        
-        Returns:
-            Dictionary with original columns + connector-added CDC metadata fields
-        """
-        result = {}
-        
-        # Add CDC metadata fields (connector-added, not in source database)
-        result["_cdc_key"] = key                    # Mapped from changefeed 'key' column
-        result["_cdc_updated"] = updated            # Mapped from changefeed 'updated' column (None in snapshot mode)
-        
-        # Derive operation type from changefeed 'value' column content
-        # (This field is added by the connector for Lakeflow CDC compatibility)
-        if value is None:
-            # DELETE operation - changefeed returns null value for deletes
-            result["_cdc_operation"] = "DELETE"
-            # For deletes, we only have the key (no row data)
-        elif include_diff and "before" in value:
-            # UPDATE operation (has both before and after)
-            result["_cdc_operation"] = "UPDATE"
-            after = value.get("after", {})
-            result.update(after)  # Add original table columns
+        if updated is None:
+            import time
+            result["_cdc_updated"] = str(int(time.time() * 1000000))
         else:
-            # INSERT or UPDATE (only after value available)
-            after = value.get("after") if value else None
-            if after:
-                result["_cdc_operation"] = "INSERT"  # Could be UPDATE without diff
-                result.update(after)  # Add original table columns
+            result["_cdc_updated"] = updated
+        
+        if value is None:
+            result["_cdc_operation"] = "DELETE"
+        else:
+            result["_cdc_operation"] = "UPSERT"
         
         return result
-    
-    def __del__(self):
-        """Close connection when object is destroyed."""
-        if self.conn and not self.conn.closed:
-            self.conn.close()
-
