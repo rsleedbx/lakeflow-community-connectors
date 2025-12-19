@@ -30,16 +30,9 @@ To discover available tables:
 3. Specify the tables you want in table_list parameter
 """
 
-# Install pg8000 - required for CockroachDB connectivity
-# Note: In Databricks, workers will install it on-demand if not available
-print("📦 Checking pg8000 dependency...")
-try:
-    import pg8000
-    print("✅ pg8000 is available")
-except ImportError:
-    print("⚠️  pg8000 not yet installed")
-    print("   Workers will install it automatically on first use")
-    print("   (or add 'pg8000>=1.30.0' to cluster libraries for faster startup)")
+# Note: This connector uses psycopg2 which is pre-installed in Databricks
+# No additional package installation required
+print("📦 Using psycopg2 (pre-installed in Databricks)")
 
 import os
 from pipeline.ingestion_pipeline import ingest

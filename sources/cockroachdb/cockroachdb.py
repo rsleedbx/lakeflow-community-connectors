@@ -1,17 +1,11 @@
 from typing import Dict, List, Iterator, Any
 import json
-import os
-import ssl
-import tempfile
+import psycopg2
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, IntegerType,
     DoubleType, BooleanType, DateType, TimestampType, BinaryType,
     DecimalType, ArrayType
 )
-
-# NOTE: Do NOT import pg8000 or psycopg2 at module level!
-# They must be imported lazily inside _get_connection() to avoid Spark serialization issues
-# pg8000 is installed at runtime in ingest.py, so it won't be available during module serialization
 
 
 class LakeflowConnect:
@@ -129,51 +123,25 @@ class LakeflowConnect:
         print(f"    sslmode: {self.sslmode}")
     
     def _get_connection(self, table_options: Dict[str, str] = None):
-        """Create and return a new connection to CockroachDB."""
+        """Create and return a new connection to CockroachDB using psycopg2."""
         try:
-            # LAZY IMPORT: Import pg8000 here (not at module level)
-            # Try to install if not available
-            try:
-                import pg8000
-            except ImportError:
-                print("📦 pg8000 not found - attempting installation in worker...")
-                try:
-                    import subprocess
-                    import sys
-                    # Install with --target to local directory that doesn't require permissions
-                    import tempfile
-                    temp_dir = tempfile.mkdtemp()
-                    subprocess.check_call(
-                        [sys.executable, "-m", "pip", "install", "--target", temp_dir, "--quiet", "pg8000>=1.30.0"],
-                        stderr=subprocess.DEVNULL
-                    )
-                    # Add to path
-                    sys.path.insert(0, temp_dir)
-                    import pg8000
-                    print("✅ pg8000 installed successfully")
-                except Exception as install_error:
-                    raise ImportError(
-                        f"pg8000 is not installed and auto-installation failed: {install_error}\n"
-                        "Please add pg8000>=1.30.0 to your cluster libraries."
-                    )
-            
-            print(f"\n🔍 DEBUG: Creating connection using pg8000...")
+            print(f"\n🔍 DEBUG: Creating connection using psycopg2...")
             print(f"  host={self.host}, port={self.port}, database={self.database}")
             
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            conn = pg8000.connect(
-                user=self.user,
-                password=self.password,
+            # Build connection string with SSL configuration
+            # Use sslmode='require' which doesn't need client certificates
+            conn = psycopg2.connect(
                 host=self.host,
                 port=self.port,
                 database=self.database,
-                ssl_context=ssl_context
+                user=self.user,
+                password=self.password,
+                sslmode='require',  # Requires SSL but doesn't verify server cert
+                connect_timeout=10
             )
+            conn.set_session(autocommit=True)
             
-            print("✅ Connected using pg8000 (pure Python driver)")
+            print("✅ Connected using psycopg2 (pre-installed in Databricks)")
             return conn
                     
         except Exception as e:
