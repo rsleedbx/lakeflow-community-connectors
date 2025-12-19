@@ -126,9 +126,7 @@ PIPELINE_JSON=$(jq -n \
         }
       },
       {
-        pypi: {
-          package: "pg8000>=1.30.0"
-        }
+        package: "pg8000>=1.30.0"
       }
     ]
   }')
