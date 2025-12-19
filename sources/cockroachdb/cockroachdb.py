@@ -525,12 +525,28 @@ class LakeflowConnect:
         
         print(f"✅ Total events collected: {len(events)}")
         
+        # DEBUG: Print sample RAW events BEFORE coalescing
+        if events:
+            print(f"\n🔍 Sample RAW events BEFORE coalescing (first 3):")
+            for i, event in enumerate(events[:3]):
+                print(f"  Event {i+1}: {event}")
+        
         # Coalesce fragmented events (from split_column_families) into complete rows
         coalesce_enabled = table_options.get("coalesce_split_families", "false").lower() == "true"
         if coalesce_enabled and events:
             print(f"\n🔄 Coalescing {len(events)} fragmented events by primary key...")
             events = self._coalesce_events_by_key(events)
             print(f"✅ Coalesced to {len(events)} complete rows")
+            
+            # DEBUG: Print sample rows to verify data
+            if events:
+                print(f"\n🔍 Sample coalesced rows AFTER (first 3):")
+                for i, row in enumerate(events[:3]):
+                    pk_value = row.get('ycsb_key', 'MISSING')
+                    cdc_key = row.get('_cdc_key', [])
+                    cdc_updated = row.get('_cdc_updated', 'MISSING')
+                    field0 = row.get('field0', 'MISSING')[:20] if row.get('field0') else 'NULL'
+                    print(f"  Row {i+1}: ycsb_key={pk_value}, _cdc_key={cdc_key}, _cdc_updated={cdc_updated}, field0={field0}...")
         
         end_offset = start_offset.copy() if start_offset else {}
         
@@ -554,7 +570,13 @@ class LakeflowConnect:
         self, key: list, value: Dict, updated: str
     ) -> Dict:
         """Transform CockroachDB changefeed event."""
-        result = value.copy() if value else {}
+        # CockroachDB changefeeds return: {"after": {"col1": "val1", ...}}
+        # Extract the "after" object which contains the actual column values
+        if value and "after" in value:
+            result = value["after"].copy()
+        else:
+            result = value.copy() if value else {}
+        
         result["_cdc_key"] = key
         
         if updated is None:
