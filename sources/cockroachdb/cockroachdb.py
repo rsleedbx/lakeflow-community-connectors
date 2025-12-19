@@ -126,9 +126,17 @@ class LakeflowConnect:
         """Create and return a new connection to CockroachDB.
         
         Uses pg8000 (pure Python PostgreSQL driver) to avoid psycopg2/libpq SSL issues.
-        pg8000 is expected to be pre-installed in Databricks runtime or added via pipeline libraries.
+        pg8000 is vendored (bundled) directly in the connector directory.
         """
         try:
+            # Add vendor directory to sys.path to find pg8000 and its dependencies
+            import sys
+            import os
+            vendor_dir = os.path.join(os.path.dirname(__file__), 'vendor')
+            if vendor_dir not in sys.path:
+                sys.path.insert(0, vendor_dir)
+                print(f"📦 Added vendor directory to path: {vendor_dir}")
+            
             # LAZY IMPORT: Import pg8000 here (not at module level for Spark serialization)
             import pg8000
             
@@ -153,12 +161,13 @@ class LakeflowConnect:
             print("✅ Connected using pg8000 (pure Python driver)")
             return conn
                     
-        except ImportError:
+        except ImportError as e:
             raise ConnectionError(
-                "pg8000 is not available in this Databricks environment.\n\n"
-                "pg8000 is required because psycopg2/libpq has SSL certificate permission issues.\n\n"
-                "NOTE: pg8000 may be pre-installed in some Databricks runtimes.\n"
-                "If not available, please add it via pipeline configuration."
+                f"Failed to import pg8000 from vendored directory.\n\n"
+                f"pg8000 and dependencies should be in: {vendor_dir}\n"
+                f"Error: {str(e)}\n\n"
+                f"This indicates the vendor directory was not uploaded correctly.\n"
+                f"Please ensure copydir.sh includes the vendor/ directory."
             )
         except Exception as e:
             raise ConnectionError(f"Failed to connect to CockroachDB: {str(e)}")
