@@ -124,9 +124,6 @@ PIPELINE_JSON=$(jq -n \
         file: {
           path: $ingest_path
         }
-      },
-      {
-        package: "pg8000>=1.30.0"
       }
     ]
   }')

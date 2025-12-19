@@ -2,6 +2,7 @@ from typing import Dict, List, Iterator, Any
 import json
 import os
 import ssl
+import tempfile
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, IntegerType,
     DoubleType, BooleanType, DateType, TimestampType, BinaryType,
@@ -131,17 +132,30 @@ class LakeflowConnect:
         """Create and return a new connection to CockroachDB."""
         try:
             # LAZY IMPORT: Import pg8000 here (not at module level)
+            # Try to install if not available
             try:
                 import pg8000
-            except ImportError as ie:
-                raise ImportError(
-                    "pg8000 is not installed. Please add it to your pipeline libraries:\n"
-                    "  libraries:\n"
-                    "    - pypi:\n"
-                    "        package: pg8000>=1.30.0\n"
-                    "Or add to cluster libraries in cluster configuration.\n"
-                    f"Original error: {ie}"
-                )
+            except ImportError:
+                print("📦 pg8000 not found - attempting installation in worker...")
+                try:
+                    import subprocess
+                    import sys
+                    # Install with --target to local directory that doesn't require permissions
+                    import tempfile
+                    temp_dir = tempfile.mkdtemp()
+                    subprocess.check_call(
+                        [sys.executable, "-m", "pip", "install", "--target", temp_dir, "--quiet", "pg8000>=1.30.0"],
+                        stderr=subprocess.DEVNULL
+                    )
+                    # Add to path
+                    sys.path.insert(0, temp_dir)
+                    import pg8000
+                    print("✅ pg8000 installed successfully")
+                except Exception as install_error:
+                    raise ImportError(
+                        f"pg8000 is not installed and auto-installation failed: {install_error}\n"
+                        "Please add pg8000>=1.30.0 to your cluster libraries."
+                    )
             
             print(f"\n🔍 DEBUG: Creating connection using pg8000...")
             print(f"  host={self.host}, port={self.port}, database={self.database}")
