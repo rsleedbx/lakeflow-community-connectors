@@ -282,49 +282,20 @@ def register_lakeflow_source(spark):
             print(f"    sslmode: {self.sslmode}")
 
         def _get_connection(self, table_options: Dict[str, str] = None):
-            """Create and return a new connection to CockroachDB."""
+            """Create and return a new connection to CockroachDB.
+
+            Uses pg8000 (pure Python PostgreSQL driver) to avoid psycopg2/libpq SSL issues.
+            pg8000 is expected to be pre-installed in Databricks runtime or added via pipeline libraries.
+            """
             try:
-                # LAZY IMPORT: Import drivers here (not at module level)
-                # Try to import pg8000, install if not available
-                try:
-                    import pg8000
-                except ImportError:
-                    # pg8000 not installed yet - install it now in this worker process
-                    print("📦 pg8000 not found - installing in worker process...")
-                    import subprocess
-                    import sys
-                    import tempfile
-                    import os
-
-                    # Create a temporary directory for installation
-                    # This avoids the read-only /.local directory issue in Databricks serverless
-                    temp_dir = tempfile.mkdtemp(prefix="pg8000_")
-                    print(f"   Installing to temporary directory: {temp_dir}")
-
-                    result = subprocess.run(
-                        [sys.executable, "-m", "pip", "install", 
-                         "--target", temp_dir,
-                         "--no-cache-dir",    # Skip cache to avoid permission issues
-                         "--isolated",        # Ignore environment variables and user config
-                         "--disable-pip-version-check",  # Skip version check that scans paths
-                         "--quiet", 
-                         "pg8000>=1.30.0"],
-                        capture_output=True,
-                        text=True
-                    )
-                    if result.returncode != 0:
-                        print(f"❌ pip install STDOUT: {result.stdout}")
-                        print(f"❌ pip install STDERR: {result.stderr}")
-                        raise ImportError(f"Failed to install pg8000: {result.stderr}")
-
-                    # Add the temp directory to Python path
-                    sys.path.insert(0, temp_dir)
-                    print(f"✅ pg8000 installed successfully to {temp_dir}")
-                    import pg8000
+                # LAZY IMPORT: Import pg8000 here (not at module level for Spark serialization)
+                import pg8000
 
                 print(f"\n🔍 DEBUG: Creating connection using pg8000...")
                 print(f"  host={self.host}, port={self.port}, database={self.database}")
 
+                # Create SSL context that doesn't verify certificates
+                # This avoids the /root/.postgresql/ permission issues with psycopg2
                 ssl_context = ssl.create_default_context()
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
@@ -341,6 +312,13 @@ def register_lakeflow_source(spark):
                 print("✅ Connected using pg8000 (pure Python driver)")
                 return conn
 
+            except ImportError:
+                raise ConnectionError(
+                    "pg8000 is not available in this Databricks environment.\n\n"
+                    "pg8000 is required because psycopg2/libpq has SSL certificate permission issues.\n\n"
+                    "NOTE: pg8000 may be pre-installed in some Databricks runtimes.\n"
+                    "If not available, please add it via pipeline configuration."
+                )
             except Exception as e:
                 raise ConnectionError(f"Failed to connect to CockroachDB: {str(e)}")
 

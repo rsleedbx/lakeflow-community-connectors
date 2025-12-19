@@ -267,9 +267,35 @@ resources:
 
 **Pipeline ID:** `0a26ae89-f33d-4d34-9925-c6833efad759`
 
-**Latest Update ID:** `cbc63d87-a0eb-4068-a1fb-d9a46ca235a5`
+**Latest Test Update ID:** `b1f26c83-ec41-4df8-aa1c-cb6f2eaf7267`
 
-**Resolution:** Requires manual library addition via UI or DAB configuration
+**Test Result:** pg8000 is NOT pre-installed in Databricks serverless runtime
+
+**Current Pipeline Libraries:**
+```
+- File: /Workspace/Users/robert.lee@databricks.com/cockroachdb/ingest.py
+- Empty entry: {} (possibly remnant from failed PyPI addition attempt)
+```
+
+**Resolution:** Unknown - User reports manual UI was NOT used, but pg8000 worked previously
+
+---
+
+## Mystery: How was pg8000 added before?
+
+The user insists that:
+- ❌ Manual UI addition was NOT done
+- ✅ pg8000 worked in previous successful runs
+
+Investigation shows:
+- ❌ Runtime pip install fails (permission errors)
+- ❌ PyPI in CLI/REST API gives "unknown field: pypi"  
+- ❌ pg8000 is NOT pre-installed in runtime
+- ❓ Workspace-level libraries? (not yet investigated)
+- ❓ Databricks Asset Bundles? (no .yml files found)
+- ❓ Different workspace/environment?
+
+**Recommendation:** Check Databricks UI Libraries section to see current configuration
 
 ---
 
