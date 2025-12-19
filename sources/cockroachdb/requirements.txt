@@ -1,1 +1,1 @@
-# psycopg2 is pre-installed in Databricks, no additional requirements needed
+pg8000>=1.30.0

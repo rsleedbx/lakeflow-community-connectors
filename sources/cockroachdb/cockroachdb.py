@@ -1,6 +1,6 @@
 from typing import Dict, List, Iterator, Any
 import json
-import psycopg2
+import ssl
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, IntegerType,
     DoubleType, BooleanType, DateType, TimestampType, BinaryType,
@@ -123,25 +123,74 @@ class LakeflowConnect:
         print(f"    sslmode: {self.sslmode}")
     
     def _get_connection(self, table_options: Dict[str, str] = None):
-        """Create and return a new connection to CockroachDB using psycopg2."""
+        """Create and return a new connection to CockroachDB."""
         try:
-            print(f"\n🔍 DEBUG: Creating connection using psycopg2...")
+            # LAZY IMPORT: Import drivers here (not at module level)
+            # Try to import pg8000, install if not available
+            try:
+                import pg8000
+            except ImportError:
+                # pg8000 not installed yet - install it now in this worker process
+                print("📦 pg8000 not found - installing in worker process...")
+                import subprocess
+                import sys
+                import tempfile
+                import os
+                
+                # Create a temporary directory for installation
+                # This avoids the read-only /.local directory issue in Databricks serverless
+                temp_dir = tempfile.mkdtemp(prefix="pg8000_")
+                print(f"   Installing to temporary directory: {temp_dir}")
+                
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", 
+                     "--target", temp_dir,
+                     "--no-cache-dir",    # Skip cache to avoid permission issues
+                     "--isolated",        # Ignore environment variables and user config
+                     "--disable-pip-version-check",  # Skip version check that scans paths
+                     "--quiet", 
+                     "pg8000>=1.30.0"],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode != 0:
+                    print(f"❌ pip install STDOUT: {result.stdout}")
+                    print(f"❌ pip install STDERR: {result.stderr}")
+                    raise ImportError(
+                        f"Failed to auto-install pg8000 in Databricks serverless environment.\n\n"
+                        f"REQUIRED ACTION: Add pg8000 library manually via Databricks UI:\n"
+                        f"1. Go to your pipeline settings\n"
+                        f"2. Navigate to Libraries section\n"
+                        f"3. Click '+ Add library'\n"
+                        f"4. Select 'PyPI'\n"
+                        f"5. Enter package name: pg8000\n"
+                        f"6. Enter version: >=1.30.0\n"
+                        f"7. Save and restart pipeline\n\n"
+                        f"Error details: {result.stderr[:500]}"
+                    )
+                
+                # Add the temp directory to Python path
+                sys.path.insert(0, temp_dir)
+                print(f"✅ pg8000 installed successfully to {temp_dir}")
+                import pg8000
+            
+            print(f"\n🔍 DEBUG: Creating connection using pg8000...")
             print(f"  host={self.host}, port={self.port}, database={self.database}")
             
-            # Build connection string with SSL configuration
-            # Use sslmode='require' which doesn't need client certificates
-            conn = psycopg2.connect(
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            conn = pg8000.connect(
+                user=self.user,
+                password=self.password,
                 host=self.host,
                 port=self.port,
                 database=self.database,
-                user=self.user,
-                password=self.password,
-                sslmode='require',  # Requires SSL but doesn't verify server cert
-                connect_timeout=10
+                ssl_context=ssl_context
             )
-            conn.set_session(autocommit=True)
             
-            print("✅ Connected using psycopg2 (pre-installed in Databricks)")
+            print("✅ Connected using pg8000 (pure Python driver)")
             return conn
                     
         except Exception as e:

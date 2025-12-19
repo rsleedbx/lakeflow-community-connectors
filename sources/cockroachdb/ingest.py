@@ -30,9 +30,9 @@ To discover available tables:
 3. Specify the tables you want in table_list parameter
 """
 
-# Note: This connector uses psycopg2 which is pre-installed in Databricks
-# No additional package installation required
-print("📦 Using psycopg2 (pre-installed in Databricks)")
+# Note: This connector uses pg8000 (pure Python PostgreSQL driver)
+# It will be automatically installed at runtime if not present
+print("📦 Using pg8000 (pure Python PostgreSQL driver - auto-install if needed)")
 
 import os
 from pipeline.ingestion_pipeline import ingest
