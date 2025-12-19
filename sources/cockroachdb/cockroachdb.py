@@ -510,15 +510,27 @@ class LakeflowConnect:
         events = []
         last_resolved = None
         
+        print(f"\n📥 Collecting events from changefeed...")
         try:
             gen = event_generator()
             for event in gen:
                 if event is not None:
                     events.append(event)
+                    if len(events) % 10000 == 0:
+                        print(f"   ... collected {len(events)} events so far")
         except StopIteration as e:
             last_resolved = e.value if hasattr(e, 'value') else None
         finally:
             conn.close()
+        
+        print(f"✅ Total events collected: {len(events)}")
+        
+        # Coalesce fragmented events (from split_column_families) into complete rows
+        coalesce_enabled = table_options.get("coalesce_split_families", "false").lower() == "true"
+        if coalesce_enabled and events:
+            print(f"\n🔄 Coalescing {len(events)} fragmented events by primary key...")
+            events = self._coalesce_events_by_key(events)
+            print(f"✅ Coalesced to {len(events)} complete rows")
         
         end_offset = start_offset.copy() if start_offset else {}
         
@@ -557,3 +569,45 @@ class LakeflowConnect:
             result["_cdc_operation"] = "UPSERT"
         
         return result
+    
+    def _coalesce_events_by_key(self, events: List[Dict]) -> List[Dict]:
+        """
+        Coalesce fragmented events (from split_column_families) into complete rows.
+        
+        With split_column_families=true, CockroachDB emits multiple events per row
+        (one per column family). This method merges them by primary key using
+        last-non-null semantics for each field.
+        
+        Args:
+            events: List of fragmented changefeed events
+            
+        Returns:
+            List of complete, merged rows
+        """
+        from collections import defaultdict
+        
+        # Group events by primary key
+        key_to_events = defaultdict(list)
+        for event in events:
+            key_tuple = tuple(event.get("_cdc_key", []))
+            key_to_events[key_tuple].append(event)
+        
+        print(f"   Unique keys found: {len(key_to_events)}")
+        if key_to_events:
+            sample_key = list(key_to_events.keys())[0]
+            print(f"   Events per key (sample): {len(key_to_events[sample_key])} events")
+        
+        # Merge events for each key
+        coalesced = []
+        for key_tuple, key_events in key_to_events.items():
+            merged = {}
+            
+            # Take last non-null value for each field
+            for event in key_events:
+                for field, value in event.items():
+                    if value is not None:
+                        merged[field] = value
+            
+            coalesced.append(merged)
+        
+        return coalesced
