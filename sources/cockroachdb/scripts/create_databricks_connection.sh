@@ -45,7 +45,7 @@ PORT=$(echo "$HOST_PORT" | cut -d':' -f2)
 # Extract database
 DATABASE=$(echo "$CONNECTION_URL" | sed -n 's|postgresql://[^@]*@[^/]*/\([^?]*\).*|\1|p')
 
-# Extract sslmode (default to require if not specified)
+# Extract sslmode (default to require - simpler and avoids client cert lookups)
 SSLMODE=$(echo "$CONNECTION_URL" | sed -n 's|.*sslmode=\([^&]*\).*|\1|p')
 SSLMODE="${SSLMODE:-require}"
 
@@ -94,7 +94,7 @@ databricks connections create --json '{
     "password": "'"$PASSWORD"'",
     "sslmode": "'"$SSLMODE"'",
     "schema": "public",
-    "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families"
+    "externalOptionsAllowList": "cursor,include_diff,select_query,resolved_interval,batch_size,initial_scan,split_column_families,query_timeout,target_rows,coalesce_split_families"
   }
 }'
 

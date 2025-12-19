@@ -118,10 +118,16 @@ PIPELINE_JSON=$(jq -n \
     serverless: true,
     continuous: false,
     development: true,
+    channel: "PREVIEW",
     libraries: [
       {
         file: {
           path: $ingest_path
+        }
+      },
+      {
+        pypi: {
+          package: "pg8000>=1.30.0"
         }
       }
     ]

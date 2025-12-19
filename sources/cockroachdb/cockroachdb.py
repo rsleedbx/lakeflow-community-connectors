@@ -130,18 +130,18 @@ class LakeflowConnect:
     def _get_connection(self, table_options: Dict[str, str] = None):
         """Create and return a new connection to CockroachDB."""
         try:
-            # LAZY IMPORT: Import drivers here (not at module level)
-            # Try to import pg8000, install if not available
+            # LAZY IMPORT: Import pg8000 here (not at module level)
             try:
                 import pg8000
-            except ImportError:
-                # pg8000 not installed yet - install it now in this worker process
-                print("📦 pg8000 not found - installing in worker process...")
-                import subprocess
-                import sys
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pg8000>=1.30.0"])
-                print("✅ pg8000 installed successfully")
-                import pg8000
+            except ImportError as ie:
+                raise ImportError(
+                    "pg8000 is not installed. Please add it to your pipeline libraries:\n"
+                    "  libraries:\n"
+                    "    - pypi:\n"
+                    "        package: pg8000>=1.30.0\n"
+                    "Or add to cluster libraries in cluster configuration.\n"
+                    f"Original error: {ie}"
+                )
             
             print(f"\n🔍 DEBUG: Creating connection using pg8000...")
             print(f"  host={self.host}, port={self.port}, database={self.database}")

@@ -15,6 +15,13 @@ This directory contains technical documentation, bug fixes, testing insights, an
 
 ### Bug Fixes & Issues
 
+- **[HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md)** ⚠️ **CRITICAL**  
+  Fixed hardcoded connection name in `ingest.py` preventing credentials from Unity Catalog:
+  - Using `"hubspot_demo"` literal instead of `connection_name` variable
+  - Caused connector to receive no credentials (only 3 basic options)
+  - Diagnosis via `hubspot_copy` test confirmed scripts were fine
+  - Fix: Use dynamic `connection_name` from pipeline configuration
+
 - **[BUG_FIX_OPERATION_DETECTION.md](BUG_FIX_OPERATION_DETECTION.md)**  
   Critical bug discovered during operation statistics implementation. Documents two issues:
   - `memoryview` object handling from psycopg2

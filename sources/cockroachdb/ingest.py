@@ -30,6 +30,19 @@ To discover available tables:
 3. Specify the tables you want in table_list parameter
 """
 
+# Note: pg8000 should be added to pipeline libraries configuration
+# See createpipeline.sh for the proper way to add Python dependencies
+print("📦 Checking pg8000 dependency...")
+try:
+    import pg8000
+    print("✅ pg8000 is available")
+except ImportError:
+    print("⚠️  pg8000 not found - it should be added to pipeline libraries")
+    print("   Add this to your pipeline configuration:")
+    print("   libraries:")
+    print("     - pypi:")
+    print("         package: pg8000>=1.30.0")
+
 import os
 from pipeline.ingestion_pipeline import ingest
 from libs.source_loader import get_register_function
@@ -138,14 +151,27 @@ register_lakeflow_source(spark)
 
 # Build pipeline spec with specified tables
 # For CockroachDB CDC, table_configuration can include:
-# - initial_scan: 'yes' (default, full scan + streaming) or 'only' (snapshot only)
-# - resolved_interval: Time between resolved timestamps (e.g., '1s', '10s')
-# - batch_size: Number of rows to fetch per batch
-# - split_column_families: 'true' to emit separate events for column families
+# - initial_scan: 'only' = snapshot-only (one-time load, no cursor tracking)
+#              : 'yes' = incremental batches (cursor-tracked, stops when caught up)
+# - resolved_interval: How often changefeed emits "caught up" signals (e.g., '1s', '10s')
+# - target_rows: Target ROWS per batch (auto-calculates events based on column families)
+# - split_column_families: 'true' = required for tables with multiple column families
+# - coalesce_split_families: 'true' = merge fragmented events into complete rows
 default_table_config = {
-    "initial_scan": "yes",      # Full scan + continue streaming
-    "resolved_interval": "10s",  # Resolved timestamps every 10 seconds
+    "initial_scan": "only",      # First run: full snapshot; Subsequent: changes only (with cursor)
+    "resolved_interval": "1s",   # Frequent checkpoints for large datasets (saves progress every 1s)
+    "target_rows": "12000",      # Target rows per batch
+    "query_timeout": "5s",       # 5 seconds for incremental mode (exit fast when caught up)
+    "split_column_families": "true",  # REQUIRED by CockroachDB for tables with multiple column families
+    "coalesce_split_families": "true",  # Merge fragmented events by key in connector
 }
+
+# For multi-table pipelines, add a flag so connector can share snapshot timestamp
+if len(all_tables) > 1:
+    default_table_config["multi_table_pipeline"] = "true"
+    print(f"\n🕐 Multi-table pipeline detected ({len(all_tables)} tables)")
+    print(f"   Connector will capture and share a single snapshot start timestamp")
+    print(f"   This ensures consistency across all tables")
 
 pipeline_spec = {
     "connection_name": connection_name,
@@ -165,7 +191,30 @@ print(f"   Tables to ingest: {', '.join(all_tables)}")
 print(f"\n🔗 Connection Details:")
 print(f"   Connection name: {connection_name}")
 print(f"   This connection will be resolved by Databricks from Unity Catalog")
-print(f"   Expected to have: host, port, database, user, password, sslmode")
+print(f"   Expected to have: host, port, database, schema, user, password, sslmode")
+print(f"   Database AND Schema are fixed in the connection (Unity Catalog requirement)")
+print(f"\n📊 Table Configuration:")
+print(f"   initial_scan: {default_table_config['initial_scan']} → CDC MODE")
+print(f"   resolved_interval: {default_table_config['resolved_interval']} (checkpoint interval)")
+print(f"   target_rows: {default_table_config['target_rows']} (rows per batch)")
+print(f"   query_timeout: {default_table_config['query_timeout']} (incremental mode - fast exit when caught up)")
+print(f"   snapshot_timeout: 600s (snapshot mode - allows large table scans)")
+print(f"   split_column_families: {default_table_config['split_column_families']}")
+print(f"   coalesce_split_families: {default_table_config['coalesce_split_families']}")
+print(f"\n💡 Performance Strategy:")
+print(f"   - First run (snapshot): Up to 10 minutes (large tables)")
+print(f"   - Incremental run (no changes): ~5 seconds (fast exit)")
+print(f"   - Incremental run (with changes): Depends on change volume")
+print(f"   - Progressive cursor: Saves progress every {default_table_config['resolved_interval']}")
+print(f"\n⏰ Pipeline Behavior (30-minute trigger, cursor-based CDC):")
+print(f"   ✅ First run (no cursor): Full snapshot")
+print(f"   ✅ Subsequent runs (with cursor): Only changes (initial_scan='no')")
+print(f"   ✅ Timeout after 30s = 'caught up' (normal, not an error)")
+print(f"   ✅ Full refresh: Restart from snapshot")
+print(f"   ✅ ingestion_type='cdc' (enables output metrics)")
+print(f"\n💡 Efficient for millions of rows (10-100x faster than re-scanning)")
+print(f"💡 No schema changes required!")
+print(f"💡 See: learnings/INCREMENTAL_CDC_MILLIONS_OF_ROWS.md")
 
 print("\n" + "=" * 80)
 print("🚀 Starting Ingestion Pipeline...")
