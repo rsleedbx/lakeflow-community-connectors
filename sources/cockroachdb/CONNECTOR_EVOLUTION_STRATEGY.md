@@ -2010,6 +2010,14 @@ For JSON CDC format, primary keys must be extracted from the `key` array before 
 
 ## 🎉 Summary
 
+### 🎯 Major Milestone Achieved (Jan 8, 2026)
+**Step 2 Complete: One-Time Load to Delta - 100%**
+- ✅ Parquet CDC processing - Working perfectly
+- ✅ JSON CDC processing - **FIXED AND VALIDATED!**
+- ✅ Perfect match: Delta 9,950 rows = Source 9,950 rows
+- ✅ All DELETE events preserved (100/100)
+- ✅ All duplicate UPDATE events removed (400/400)
+
 ### What We Built
 - ✅ Three patterns: Iterator, Autoloader, DLT
 - ✅ 55% code reuse across patterns
@@ -2019,28 +2027,38 @@ For JSON CDC format, primary keys must be extracted from the `key` array before 
 - ✅ Automatic schema file generation
 - ✅ Flexible path handling (legacy + timestamped)
 - ✅ Complete documentation (40+ files)
+- ✅ **JSON format support with full CDC operations**
+- ✅ **Initial table deduplication to latest state**
 
 ### Production Ready Features
 - ✅ Column family fragment merging
-- ✅ DELETE operation filtering
-- ✅ Accurate operation classification
+- ✅ DELETE operation handling (initial + incremental)
+- ✅ Accurate operation classification (SNAPSHOT/INSERT/UPDATE/DELETE)
 - ✅ Timestamp-based CDC detection
-- ✅ Primary key management
+- ✅ Primary key management (Parquet + JSON)
+- ✅ **JSON primary key extraction from `key` array**
+- ✅ **Window-based deduplication for initial loads**
 - ✅ Backward compatibility
 - ✅ Unity Catalog integration
 - ✅ Spark Connect support
 
-### Next Steps (When Needed)
-1. Deploy Native DLT pattern to production
-2. Add CI/CD integration with validation mode
-3. Create performance benchmarking suite
-4. Add S3/ABFSS support (currently Azure-only)
-5. Implement foreachBatch + MERGE for continuous streaming
+### Critical Fixes Delivered (Jan 8, 2026)
+1. **JSON Primary Key Extraction** - Fixed 99 lost DELETEs (Commit: `457d912`)
+2. **Initial Table Deduplication** - Fixed 400 duplicate UPDATEs (Commit: `7db8d2c`)
+3. **Result:** Perfect row count match with source data
 
-**Status: ✅ READY FOR PRODUCTION DEPLOYMENT**
+### Next Steps
+1. **Step 3:** Incremental Load (repeated CDC runs with new data)
+2. **Step 4:** DLT + Autoloader (production streaming pipelines)
+3. **Step 5:** Community Connector (iterator pattern for low-volume)
+4. Add CI/CD integration with validation mode
+5. Create performance benchmarking suite
+6. Add S3/ABFSS support (currently Azure-only)
+
+**Status: ✅ STEPS 1 & 2 COMPLETE - READY FOR INCREMENTAL TESTING**
 
 ---
 
 *Last updated: January 8, 2026*  
-*Version: 2.0*  
+*Version: 2.1 - JSON CDC Complete*  
 *Maintainer: Lakeflow Community Connectors Team*
