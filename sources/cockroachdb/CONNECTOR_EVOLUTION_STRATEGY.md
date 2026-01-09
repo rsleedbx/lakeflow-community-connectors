@@ -1782,6 +1782,15 @@ Always check `.isNull()` in addition to string comparisons.
 - **Fix:** Added `.isNull()` check for SQL NULL case
 - **Key Insight:** Local testing (Python) revealed logic was correct; debug columns revealed Spark-specific behavior
 
+### 10. JSON Primary Key Extraction is MANDATORY
+For JSON CDC format, primary keys must be extracted from the `key` array before merge.
+- **Impact:** Fixed 99 lost DELETE events (100 DELETEs → 1 DELETE after merge)
+- **Root Cause:** All DELETEs had NULL `ycsb_key`, so `groupBy(ycsb_key, timestamp, operation)` merged them into 1 row
+- **Fix:** Added `F.col("key").getItem(i)` extraction for each primary key column
+- **Code Location:** `_add_cdc_metadata_to_dataframe()` in `cockroachdb.py` (lines ~1242-1247)
+- **Key Insight:** Diagnostic showed "Unique (key + updated + operation): 1" for 100 DELETEs → all had same NULL key!
+- **Lesson:** Always validate that PK columns exist and are populated before calling `merge_column_family_fragments`
+
 ---
 
 ## 🎉 Summary
