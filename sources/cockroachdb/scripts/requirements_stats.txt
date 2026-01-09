@@ -1,0 +1,15 @@
+# Python dependencies for changefeed file analysis
+# Used by: changefeed_helper.py analyze-files command
+#
+# Install:
+#   pip install -r requirements_stats.txt
+
+# Required for all formats
+azure-storage-blob>=12.0.0
+
+# Required for Parquet format
+pyarrow>=10.0.0
+pandas>=1.5.0
+
+
+

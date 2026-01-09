@@ -1,4 +1,4 @@
-# Critical Bug Fix: Hardcoded Connection Name in ingest.py
+# Critical Fix: Unity Catalog Connections Require channel=preview
 
 ## Date
 December 18, 2025
@@ -15,55 +15,88 @@ ValueError: Missing required connection parameters: host, database, user
 ```
 
 ## Investigation
-Initially suspected the deployment scripts (copydir.sh, createpipeline.sh) were at fault, since the HubSpot connector with the same connection worked in earlier tests.
+Initially suspected multiple causes:
+1. Deployment scripts (copydir.sh, createpipeline.sh)
+2. Hardcoded connection name in ingest.py
+3. Connection configuration issues
 
 Created `hubspot_copy` (exact copy of hubspot.py) and deployed it using cockroachdb scripts to isolate the issue. Both connectors failed identically, confirming the scripts were fine.
 
-## Root Cause
-Line 151 in `sources/cockroachdb/ingest.py` had a **hardcoded connection name**:
+## Root Cause: Missing channel=preview
+**The actual issue was that Unity Catalog connections require the `channel=preview` parameter in the DLT pipeline configuration.**
 
+Unity Catalog connection support was a preview feature at the time, and without explicitly enabling the preview channel, the connection parameters were not being passed to the connector.
+
+## ❌ Initial Misdiagnosis
+Initially thought the issue was a hardcoded connection name in `ingest.py`:
 ```python
 pipeline_spec = {
-    "connection_name": "hubspot_demo",  # ❌ WRONG: Hardcoded!
+    "connection_name": "hubspot_demo",  # This wasn't the real issue
     "objects": [...]
 }
 ```
 
-This caused the pipeline to attempt using the `hubspot_demo` connection instead of the `robert_lee_battle-walrus-11108` connection that was:
-1. Created via `create_databricks_connection.sh`
-2. Configured in the DLT pipeline configuration
-3. Read from `spark.conf.get("connection_name")` at line 93
+While this should be dynamic (using the `connection_name` variable), this was **NOT** the root cause of the credential passing issue.
 
-The `ingestion_pipeline.py` uses `pipeline_spec["connection_name"]` to look up the connection in Unity Catalog. Since it was looking for `hubspot_demo` (which doesn't exist or has different credentials), the connector received no credentials.
-
-## Fix
-Changed line 151 to use the variable instead of a hardcoded string:
+## ✅ Actual Fix
+Add `channel=preview` to the DLT pipeline configuration in `createpipeline.sh`:
 
 ```python
-pipeline_spec = {
-    "connection_name": connection_name,  # ✅ CORRECT: Use variable!
-    "objects": [...]
+pipeline_config = {
+    "name": f"{catalog}.{schema}.{pipeline_name}",
+    "channel": "preview",  # ✅ REQUIRED for Unity Catalog connections!
+    "storage": f"{workspace_path}/storage",
+    "configuration": {
+        "connection_name": connection_name,
+        ...
+    },
+    ...
 }
 ```
+
+## Why channel=preview is Required
+Unity Catalog connections with **community connectors** require the preview channel. Without explicitly opting into the preview channel:
+- The DLT runtime uses stable channel
+- Stable channel doesn't support Unity Catalog connections **for community connectors**
+- Connection parameters are not resolved/passed to custom connectors
+- Community connector only receives connection name, not actual credentials
+
+With `channel=preview`:
+- DLT uses preview runtime
+- Preview runtime supports Unity Catalog connections **for community connectors**
+- Connection parameters are properly resolved from UC
+- Community connector receives all credentials (host, port, database, user, password, etc.)
+
+**Note:** Built-in Databricks connectors may work with UC connections on stable channel. This limitation is specific to community/custom connectors.
 
 ## Impact
-- **Scripts (copydir.sh, createpipeline.sh)**: ✅ Were always correct, no changes needed
-- **ingest.py**: ✅ Fixed to use dynamic connection_name from pipeline configuration
+- **Scripts (copydir.sh, createpipeline.sh)**: ✅ Updated to include `channel=preview`
+- **ingest.py**: ✅ Connection name should still be dynamic (not hardcoded)
 - **Connector**: ✅ Now receives all connection parameters from Unity Catalog
 
 ## Lesson Learned
-When debugging connector credential issues:
-1. First check if the connection name in `pipeline_spec` matches the actual connection
+When debugging **community connector** credential issues with Unity Catalog connections:
+1. **First check if `channel=preview` is set in the pipeline configuration**
+   - This is required for community/custom connectors using UC connections
+   - Built-in connectors may not have this requirement
 2. Verify the connection name is dynamic (from config) not hardcoded
-3. The deployment scripts are likely fine if other connectors work with them
+3. Ensure the Unity Catalog connection exists and is properly configured
+4. Check Databricks documentation for preview feature requirements for community connectors
 
 ## Testing
 After fix:
+- Updated `createpipeline.sh` to include `"channel": "preview"`
 - Redeployed using `./copydir.sh`
-- Restarted pipeline
-- Connector should now receive all connection parameters (token, base_url, host, port, database, user, password, sslmode)
+- Created new pipeline with preview channel
+- Connector now receives all connection parameters (token, base_url, host, port, database, user, password, sslmode)
 
 ## Files Changed
-- `sources/cockroachdb/ingest.py` - Line 151
+- `sources/cockroachdb/scripts/createpipeline.sh` - Added `"channel": "preview"`
+- `sources/cockroachdb/ingest.py` - Connection name should be dynamic (best practice)
+
+## Reference
+- Databricks DLT preview channel documentation
+- Unity Catalog connection support in DLT (preview feature)
+
 
 

@@ -1,0 +1,369 @@
+# Cursor Rules: CockroachDB Pipeline Testing & Monitoring
+
+## Workflow: Run Pipeline with Full Refresh and Monitor
+
+When testing CockroachDB pipelines (both `cockroachdb` and `cockroachdb_s3`), follow this workflow:
+
+### 1. Start Full Refresh
+
+```bash
+# Get pipeline ID
+PIPELINE_ID=$(databricks pipelines list-pipelines --filter "name LIKE 'PIPELINE_NAME'" --output json | jq -r ".[] | select(.name == \"PIPELINE_NAME\") | .pipeline_id")
+
+# Start full refresh (note: pipeline ID is positional argument)
+databricks pipelines start-update "$PIPELINE_ID" \
+  --full-refresh \
+  --output json > /tmp/update_start.json
+
+# Extract update ID
+UPDATE_ID=$(cat /tmp/update_start.json | jq -r '.update_id')
+
+echo "✅ Started full refresh"
+echo "   Pipeline ID: $PIPELINE_ID"
+echo "   Update ID: $UPDATE_ID"
+```
+
+### 2. Monitor Update Progress
+
+```bash
+# Poll for status (note: both pipeline ID and update ID are positional arguments)
+while true; do
+  STATUS=$(databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+    --output json | jq -r '.update.state')
+  
+  echo "$(date): Status = $STATUS"
+  
+  if [[ "$STATUS" == "COMPLETED" ]] || [[ "$STATUS" == "FAILED" ]] || [[ "$STATUS" == "CANCELED" ]]; then
+    break
+  fi
+  
+  sleep 10
+done
+```
+
+### 3. Get Detailed Results
+
+```bash
+# Get full update details (positional arguments)
+databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json > /tmp/update_result.json
+
+# Extract key metrics
+cat /tmp/update_result.json | jq '{
+  state: .update.state,
+  creation_time: .update.creation_time,
+  start_time: .update.start_time,
+  completion_time: .update.completion_time,
+  duration_seconds: (if .update.completion_time and .update.start_time then ((.update.completion_time - .update.start_time) / 1000 | floor) else "N/A" end),
+  num_output_rows: .update.metrics.num_output_rows,
+  num_input_rows: .update.metrics.num_input_rows,
+  num_input_bytes: .update.metrics.num_input_bytes
+}'
+```
+
+### 4. Check Table Row Counts
+
+```bash
+# For each table in the pipeline
+databricks sql query \
+  --warehouse-id "$WAREHOUSE_ID" \
+  --statement "SELECT COUNT(*) as row_count FROM main.schema_name.table_name"
+```
+
+### 5. View Event Logs (stderr/stdout)
+
+```bash
+# Get event logs (positional arguments)
+databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json | jq -r '.update.events[] | select(.level == "ERROR" or .level == "WARN")'
+```
+
+## Complete Monitoring Script
+
+Save as `sources/cockroachdb/scripts/monitor_pipeline.sh`:
+
+```bash
+#!/bin/bash
+# Monitor CockroachDB pipeline execution
+
+set -e
+
+PIPELINE_NAME="${1:-robert_lee_cockroachdb}"
+CATALOG="${2:-main}"
+SCHEMA="${3:-robert_lee_cockroachdb_cdc}"
+
+echo "🚀 Starting pipeline monitoring..."
+echo "   Pipeline: $PIPELINE_NAME"
+echo "   Catalog: $CATALOG"
+echo "   Schema: $SCHEMA"
+echo ""
+
+# Get pipeline ID
+echo "📋 Getting pipeline ID..."
+PIPELINE_ID=$(databricks pipelines list-pipelines --filter "name LIKE '$PIPELINE_NAME'" --output json | jq -r ".[] | select(.name == \"$PIPELINE_NAME\") | .pipeline_id")
+
+if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" == "null" ]; then
+    echo "❌ Pipeline not found: $PIPELINE_NAME"
+    exit 1
+fi
+
+echo "   Pipeline ID: $PIPELINE_ID"
+echo ""
+
+# Start full refresh (positional argument)
+echo "🔄 Starting full refresh..."
+UPDATE_OUTPUT=$(databricks pipelines start-update "$PIPELINE_ID" \
+  --full-refresh \
+  --output json)
+
+UPDATE_ID=$(echo "$UPDATE_OUTPUT" | jq -r '.update_id')
+
+if [ -z "$UPDATE_ID" ] || [ "$UPDATE_ID" == "null" ]; then
+    echo "❌ Failed to start update"
+    echo "$UPDATE_OUTPUT" | jq '.'
+    exit 1
+fi
+
+echo "   Update ID: $UPDATE_ID"
+echo "   Started at: $(date)"
+echo ""
+
+# Monitor progress
+echo "⏳ Monitoring progress..."
+START_TIME=$(date +%s)
+ITERATION=0
+
+while true; do
+  ITERATION=$((ITERATION + 1))
+  
+  # Get update status (positional arguments)
+  UPDATE_JSON=$(databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+    --output json)
+  
+  STATE=$(echo "$UPDATE_JSON" | jq -r '.update.state')
+  CURRENT_TIME=$(date +%s)
+  ELAPSED=$((CURRENT_TIME - START_TIME))
+  
+  echo "   [$ELAPSED s] State: $STATE"
+  
+  # Check if complete
+  if [[ "$STATE" == "COMPLETED" ]]; then
+    echo ""
+    echo "✅ Pipeline completed successfully!"
+    break
+  elif [[ "$STATE" == "FAILED" ]]; then
+    echo ""
+    echo "❌ Pipeline failed!"
+    echo ""
+    echo "Error details:"
+    echo "$UPDATE_JSON" | jq -r '.update.events[] | select(.level == "ERROR") | .message'
+    exit 1
+  elif [[ "$STATE" == "CANCELED" ]]; then
+    echo ""
+    echo "⚠️  Pipeline was canceled"
+    exit 1
+  fi
+  
+  # Show progress every 30 seconds
+  if [ $((ITERATION % 3)) -eq 0 ]; then
+    echo "$UPDATE_JSON" | jq -r '.update.events[-5:] | .[] | "      \(.timestamp): \(.message)"' 2>/dev/null || true
+  fi
+  
+  sleep 10
+done
+
+# Get final metrics
+echo ""
+echo "📊 Final Metrics:"
+echo "──────────────────────────────────────────────────────"
+
+UPDATE_JSON=$(databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json)
+
+echo "$UPDATE_JSON" | jq -r '
+  .update | 
+  "   Duration: \(((.completion_time // now) - .start_time) / 1000 | floor) seconds
+   Input Rows: \(.metrics.num_input_rows // "N/A")
+   Output Rows: \(.metrics.num_output_rows // "N/A")
+   Input Bytes: \(.metrics.num_input_bytes // "N/A")
+   State: \(.state)"
+'
+
+echo ""
+
+# Get table row counts
+echo "📋 Table Row Counts:"
+echo "──────────────────────────────────────────────────────"
+
+# List all tables in the schema
+TABLES=$(databricks sql query \
+  --warehouse-id "$(databricks warehouses list --output json | jq -r '.[0].id')" \
+  --statement "SHOW TABLES IN ${CATALOG}.${SCHEMA}" \
+  --output json 2>/dev/null | jq -r '.result.data_array[][1]' || echo "")
+
+if [ -z "$TABLES" ]; then
+    echo "   ⚠️  Could not retrieve table list"
+else
+    for TABLE in $TABLES; do
+        COUNT=$(databricks sql query \
+          --warehouse-id "$(databricks warehouses list --output json | jq -r '.[0].id')" \
+          --statement "SELECT COUNT(*) FROM ${CATALOG}.${SCHEMA}.${TABLE}" \
+          --output json 2>/dev/null | jq -r '.result.data_array[0][0]' || echo "Error")
+        
+        printf "   %-30s %s\n" "$TABLE:" "$COUNT rows"
+    done
+fi
+
+echo ""
+echo "✅ Monitoring complete!"
+echo ""
+echo "💡 View logs in UI:"
+echo "   https://YOUR_WORKSPACE.databricks.com/?o=YOUR_ORG#joblist/pipelines/$PIPELINE_ID/updates/$UPDATE_ID"
+```
+
+## Common Issues & Debugging
+
+### Issue: "No rows were output"
+
+**Cause**: Usually a problem with:
+- Initial scan settings
+- Event coalescing logic
+- Schema mismatches
+
+**Debug**:
+```bash
+# Check raw events were received
+databricks sql query \
+  --warehouse-id "$WAREHOUSE_ID" \
+  --statement "SELECT COUNT(*) FROM main.schema.table_raw_events"
+
+# Check stderr for issues (positional arguments)
+databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json | jq -r '.update.events[] | select(.level == "ERROR" or .message | contains("row"))'
+```
+
+### Issue: Pipeline hangs/timeouts
+
+**Cause**: CockroachDB changefeed waiting for events
+
+**Debug**:
+```bash
+# Check last event timestamp
+databricks sql query \
+  --warehouse-id "$WAREHOUSE_ID" \
+  --statement "SELECT MAX(_cdc_updated) FROM main.schema.table_name"
+
+# Check CockroachDB changefeed status
+cockroach sql $COCKROACHDB_URL -e "
+  SELECT job_id, status, running_status, error 
+  FROM [SHOW JOBS] 
+  WHERE job_type = 'CHANGEFEED' 
+  ORDER BY created DESC 
+  LIMIT 5;
+"
+```
+
+### Issue: Row count mismatch
+
+**Cause**: Split column families not coalesced correctly
+
+**Debug**:
+```bash
+# Compare raw vs coalesced vs final
+databricks sql query \
+  --warehouse-id "$WAREHOUSE_ID" \
+  --statement "
+    SELECT 
+      'raw' as stage, 
+      COUNT(*) as cnt 
+    FROM main.schema.table_raw_events
+    
+    UNION ALL
+    
+    SELECT 
+      'coalesced', 
+      COUNT(*) 
+    FROM main.schema.table_coalesced
+    
+    UNION ALL
+    
+    SELECT 
+      'final', 
+      COUNT(*) 
+    FROM main.schema.table_name
+  "
+
+# Should see:
+# raw: ~110,000 (10K rows × 11 column families)
+# coalesced: ~10,000 (after merging)
+# final: ~10,000 (after dedup)
+```
+
+## Quick Commands Reference
+
+```bash
+# List all pipelines
+databricks pipelines list-pipelines --output json | jq -r '.[] | "\(.name): \(.pipeline_id)"'
+
+# Get pipeline by name
+PIPELINE_ID=$(databricks pipelines list-pipelines --filter "name LIKE 'pipeline_name'" --output json | jq -r ".[] | select(.name == \"pipeline_name\") | .pipeline_id")
+
+# List recent updates (positional argument)
+databricks pipelines list-updates "$PIPELINE_ID" --output json | jq -r '.[] | "\(.update_id): \(.state)"'
+
+# Cancel running update (positional argument)
+databricks pipelines stop "$PIPELINE_ID"
+
+# Download stderr/stdout (positional arguments)
+databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json | jq -r '.update.events[] | .message' > pipeline_logs.txt
+
+# Get ERROR messages only
+databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json | jq -r '.update.events[] | select(.level == "ERROR") | .message'
+
+# Get ERROR and WARN messages with timestamps
+databricks pipelines get-update "$PIPELINE_ID" "$UPDATE_ID" \
+  --output json | jq -r '.update.events[] | select(.level == "ERROR" or .level == "WARN") | "[\(.level)] \(.message)"'
+
+# Check data lineage
+databricks sql query \
+  --warehouse-id "$WAREHOUSE_ID" \
+  --statement "
+    SELECT 
+      _source_file,
+      _ingestion_time,
+      COUNT(*) as rows
+    FROM main.schema.table_coalesced
+    GROUP BY _source_file, _ingestion_time
+    ORDER BY _ingestion_time DESC
+  "
+```
+
+## Environment Setup
+
+Always set these before running monitoring commands:
+
+```bash
+export DATABRICKS_HOST="https://YOUR_WORKSPACE.databricks.com"
+export DATABRICKS_TOKEN="dapi..."
+export COCKROACHDB_URL="postgresql://user:pass@host:26257/db?sslmode=require"
+```
+
+## AI Assistant Instructions
+
+When the user asks to run and monitor a CockroachDB pipeline:
+
+1. **Use the monitoring script** above or adapt the commands
+2. **Start with full refresh** to ensure clean state
+3. **Poll for status** every 10-30 seconds
+4. **Extract metrics** from the final update JSON
+5. **Check table row counts** using SQL queries
+6. **Show any ERROR/WARN messages** from event logs
+7. **Compare expected vs actual** row counts
+8. **Provide debugging commands** if issues found
+
+## Example Interaction
+
+```
+User: "run the pipeline and check if changes are seen"

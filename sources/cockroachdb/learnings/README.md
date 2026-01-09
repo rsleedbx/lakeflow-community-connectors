@@ -1,124 +1,123 @@
-# CockroachDB Connector - Development Learnings
+# CockroachDB Learnings Documentation
 
-This directory contains technical documentation, bug fixes, testing insights, and architectural decisions made during the development of the CockroachDB connector.
+## 📚 Master CDC Testing Documents
 
-## 📚 Contents
+### Core CDC References (Current & Authoritative)
 
-### Project Organization
+1. **📊 CDC_TEST_MATRIX_RESULTS.md** - **MASTER DOCUMENT**
+   - Comprehensive CDC test results (Dec 22, 2025)
+   - Tests all format/table/split combinations
+   - 100% success rate (6/6 valid tests)
+   - Includes Parquet vs JSON format comparison
+   - **Status**: ✅ Current - Use this as primary reference
 
-- **[SCRIPT_REORGANIZATION.md](SCRIPT_REORGANIZATION.md)**  
-  Summary of script organization into `../scripts/` directory:
-  - All test and setup scripts moved to dedicated directory
-  - Documentation updates across all files
-  - Before/after structure comparison
-  - Benefits of cleaner organization
+2. **⚡ CDC_QUICK_REFERENCE.md**
+   - Quick summary of what works
+   - Recommended configurations
+   - Common mistakes and fixes
+   - **Status**: ✅ Current - Quick lookup
 
-### Bug Fixes & Issues
+3. **🔧 PARQUET_FORMAT_FIX.md**
+   - CockroachDB native Parquet format specification
+   - Explains `__crdb__event_type` column behavior
+   - Why event counts = rows × column families
+   - **Status**: ✅ Current - Format reference
 
-- **[HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md)** ⚠️ **CRITICAL**  
-  Fixed hardcoded connection name in `ingest.py` preventing credentials from Unity Catalog:
-  - Using `"hubspot_demo"` literal instead of `connection_name` variable
-  - Caused connector to receive no credentials (only 3 basic options)
-  - Diagnosis via `hubspot_copy` test confirmed scripts were fine
-  - Fix: Use dynamic `connection_name` from pipeline configuration
+4. **🎯 PARQUET_UPDATE_DETECTION.md**
+   - Enhanced UPDATE detection for Parquet format
+   - Timestamp-based logic to distinguish SNAPSHOT from UPDATE
+   - Implementation details and edge cases
+   - Comparison with JSON format's explicit detection
+   - **Status**: ✅ Current - Technical enhancement (Dec 23, 2025)
 
-- **[BUG_FIX_OPERATION_DETECTION.md](BUG_FIX_OPERATION_DETECTION.md)**  
-  Critical bug discovered during operation statistics implementation. Documents two issues:
-  - `memoryview` object handling from psycopg2
-  - Wrong column index mapping in changefeed results
-  - How the fix was discovered and implemented
+5. **📖 TEST_AZURE_CDC_USAGE.md**
+   - test_azure_cdc.sh usage guide
+   - Script examples and output
+   - Troubleshooting tips
+   - **Status**: ✅ Current - Script documentation
 
-- **[CHANGEFEED_OPTIONS_FIX.md](CHANGEFEED_OPTIONS_FIX.md)**  
-  Documents the fix for CockroachDB changefeed option incompatibilities:
-  - `initial_scan='only'` cannot be combined with `updated` or `resolved`
-  - Conditional query building based on scan mode
+---
 
-- **[CTRL_C_FIX.md](CTRL_C_FIX.md)**  
-  Explains why Ctrl+C wasn't working in `test_local.py` and the solution:
-  - Issue with `signal.SIGALRM` interfering with `KeyboardInterrupt`
-  - Migration to `threading.Thread` for timeouts
+## 🗑️ Recently Cleaned Up (Dec 23, 2025)
 
-### Testing & Development
+The following outdated/redundant documents were removed to reduce confusion:
 
-- **[REMOTE_TESTING.md](REMOTE_TESTING.md)**  
-  Complete guide for testing against remote CockroachCloud clusters:
-  - Using `--url` parameter with PostgreSQL connection URLs
-  - SSL/TLS configuration (verify-full, require, disable)
-  - Security best practices for password handling
-  - Limitations and workarounds for remote testing
-  - Troubleshooting connection issues
+### Deleted Documents
+1. ❌ `TEST_REPORT_CDC.md` - Outdated (Dec 2024, 1 year old)
+2. ❌ `WORKLOAD_TESTING_SUMMARY.md` - About workload types, not CDC behavior
+3. ❌ `FAST_TESTING_UPGRADE.md` - Info integrated into current docs
+4. ❌ `CDC_TESTING_GUIDE.md` - Superseded by CDC_TEST_MATRIX_RESULTS.md
+5. ❌ `TEST_RESULTS.md` - About vendor removal, unrelated to CDC
 
-- **[TEST_REPORT_CDC.md](TEST_REPORT_CDC.md)**  
-  Comprehensive CDC testing report including:
-  - Test results for snapshot and streaming modes
-  - Performance metrics (~5,000 ops/sec with YCSB)
-  - Technical insights on changefeed behavior
-  - Production recommendations
+### Why Cleaned Up
+- **Confusion**: Too many test documents with conflicting information
+- **Outdated**: Some docs from 2024 with incorrect assumptions
+- **Redundant**: Information duplicated across multiple files
+- **Clarity**: New users need single source of truth
 
-- **[PYTEST_INTEGRATION_SUMMARY.md](PYTEST_INTEGRATION_SUMMARY.md)**  
-  Documents the integration of pytest test suite:
-  - Created test files and configs per lakeflow-community-connectors guidelines
-  - Test results (80% pass rate)
-  - Known CDC-specific limitations
-  - Comparison of pytest vs manual testing
+---
 
-- **[TEST_LOCAL_FEATURES.md](TEST_LOCAL_FEATURES.md)** (if exists)  
-  Features and capabilities of the interactive test script
+## ✅ Key CDC Findings (From Master Document)
 
-- **[DEBUGGING_HANGS.md](DEBUGGING_HANGS.md)**  
-  Troubleshooting guide for common issues causing test hangs:
-  - Rangefeeds not enabled
-  - Network/firewall issues
-  - Changefeed timeout behavior
+### What Works
+- ✅ JSON format: Snapshot + CDC
+- ✅ Parquet format: Snapshot + CDC
+- ✅ split_column_families: Required for multi-family tables
+- ✅ Both formats flush to Azure within 60 seconds
 
-### Performance & Optimization
+### Critical Requirements
+- ⏱️ **60+ seconds** wait time for CDC files
+- 📊 **500+ operations** for reliable flush
+- 🔀 **split_column_families** for multi-family tables (CockroachDB requirement)
 
-- **[FAST_TESTING_UPGRADE.md](FAST_TESTING_UPGRADE.md)**  
-  Documents the upgrade from bash scripts to CockroachDB built-in workloads:
-  - 2,500x performance improvement (~2 ops/sec → ~5,000 ops/sec)
-  - Using `cockroach workload` for realistic data generation
-  - Benefits for testing and development
+### Format Comparison
 
-- **[WORKLOAD_GENERATORS.md](WORKLOAD_GENERATORS.md)**  
-  Comparison of different data generation methods:
-  - Custom bash scripts vs built-in workloads
-  - YCSB, TPC-C, KV, MovR workload characteristics
-  - Performance metrics and use cases
+| Feature | Parquet | JSON |
+|---------|---------|------|
+| **File size** | Smaller (compressed) | Larger (nested) |
+| **Update detection** | ⚠️ 'c' for both snapshot & update | ✅ before/after distinction |
+| **Performance** | ✅ Better for analytics | ⚠️ Slower queries |
+| **Debugging** | ⚠️ Requires tools | ✅ Human-readable |
+| **Production** | ✅ Recommended | Use for audit trails |
 
-- **[WORKLOAD_TESTING_SUMMARY.md](WORKLOAD_TESTING_SUMMARY.md)**  
-  Complete testing matrix for all CockroachDB workloads:
-  - 4 fully supported workloads (ycsb, tpcc, kv, movr)
-  - 2 partially supported (bank, tpch) - database setup required
-  - 4 not applicable (special-purpose workloads)
-  - Performance comparison and recommendations
+### Important Parquet Behavior
+⚠️ **Parquet uses `__crdb__event_type='c'` for BOTH snapshots AND updates**, making them indistinguishable by event type alone.
 
-### Architecture & Design
+**Workaround**: Use timestamps or JSON format for explicit update detection.
 
-- **[SIMPLIFIED_ARCHITECTURE.md](SIMPLIFIED_ARCHITECTURE.md)**  
-  Documents the simplification of testing architecture:
-  - Removal of redundant shell scripts
-  - Integration of functionality into `test_local.py`
-  - Rationale for design decisions
+---
 
-## 🎯 Purpose
+## 🔍 How to Use This Documentation
 
-These documents serve as:
-- **Learning resources** for future contributors
-- **Historical record** of design decisions and bug fixes
-- **Troubleshooting guides** for common issues
-- **Best practices** for CDC connector development
+### For New Users
+1. Start with **CDC_QUICK_REFERENCE.md** for overview
+2. Read **CDC_TEST_MATRIX_RESULTS.md** for comprehensive details
+3. Use **TEST_AZURE_CDC_USAGE.md** to run your own tests
 
-## 📖 Related Documentation
+### For Troubleshooting
+1. Check **CDC_QUICK_REFERENCE.md** → "Common Mistakes" section
+2. Verify your setup matches tested configurations in **CDC_TEST_MATRIX_RESULTS.md**
+3. Review **PARQUET_FORMAT_FIX.md** if working with Parquet format
 
-For user-facing documentation, see:
-- **[../README.md](../README.md)** - Main connector documentation
-- **[../cockroachdb_api_doc.md](../cockroachdb_api_doc.md)** - CockroachDB API reference
+### For Production Planning
+1. Review format comparison in **CDC_TEST_MATRIX_RESULTS.md** → "Appendix"
+2. Check performance metrics and timing requirements
+3. Choose format based on your use case (analytics vs. audit trail)
 
-## 🤝 Contributing
+---
 
-When adding new learnings:
-1. Use descriptive filenames (e.g., `BUG_FIX_*.md`, `DEBUGGING_*.md`)
-2. Include problem description, root cause, and solution
-3. Add code examples where relevant
-4. Update this README with a brief description
+## 📝 Documentation Status
 
+**Last Cleanup**: December 23, 2025  
+**Master Document**: CDC_TEST_MATRIX_RESULTS.md (Dec 22, 2025)  
+**Test Coverage**: 8 combinations, 100% success rate (6/6 valid)  
+**Status**: ✅ **Current and authoritative**
+
+---
+
+## 🎯 Single Source of Truth
+
+**For all CDC behavior and testing questions, refer to:**
+- **CDC_TEST_MATRIX_RESULTS.md** (Master)
+
+All other CDC test documents have been archived or deleted to prevent confusion.

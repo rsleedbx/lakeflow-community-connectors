@@ -1,0 +1,77 @@
+# Databricks Asset Bundle for CockroachDB Connector
+# This bundle is at the repo root to include libs/, pipeline/, and sources/ directories
+bundle:
+  name: cockroachdb_connector
+
+# Sync pattern: include all necessary files from multiple directories
+sync:
+  include:
+    - "libs/*.py"
+    - "pipeline/*.py"
+    - "sources/cockroachdb/__init__.py"
+    - "sources/cockroachdb/_generated_cockroachdb_python_source.py"
+    - "sources/cockroachdb/cockroachdb.py"
+    - "sources/cockroachdb/ingest.py"
+    - "sources/cockroachdb/vendor/**"
+  exclude:
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+    - "**/test/**"
+    - "**/scripts/**"
+    - "**/configs/**"
+    - "**/learnings/**"
+    - "**/.gitignore"
+    - "**/*.md"
+
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: main
+  
+  schema_name:
+    description: Schema name for output tables
+    default: ${workspace.current_user.short_name}_cockroachdb
+  
+  connection_name:
+    description: Unity Catalog connection name for CockroachDB
+    default: ${workspace.current_user.short_name}_battle-walrus-11108
+  
+  table_list:
+    description: Comma-separated list of tables to ingest
+    default: usertable
+
+targets:
+  development:
+    mode: development
+    default: true
+    variables:
+      schema_name: ${workspace.current_user.short_name}_cockroachdb
+  
+  production:
+    mode: production
+    variables:
+      schema_name: cockroachdb_production
+
+resources:
+  pipelines:
+    cockroachdb_pipeline:
+      name: ${workspace.current_user.short_name}_cockroachdb
+      
+      catalog: ${var.catalog}
+      target: ${var.schema_name}
+      
+      channel: PREVIEW
+      serverless: true
+      development: true
+      
+      configuration:
+        connection_name: ${var.connection_name}
+        source_name: cockroachdb
+        table_list: ${var.table_list}
+      
+      libraries:
+        - file:
+            path: ./ingest.py
+        - pypi:
+            package: pg8000
+

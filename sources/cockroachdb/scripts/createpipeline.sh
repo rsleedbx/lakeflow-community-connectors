@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Create DLT pipeline for CockroachDB connector
 # Usage: ./createpipeline.sh [connection_name] [table_list]
 #

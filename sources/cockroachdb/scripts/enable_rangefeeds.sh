@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ################################################################################
 # Enable Rangefeeds for CockroachDB CDC
 #

@@ -251,3 +251,10 @@ See:
 - `cockroachdb.py::read_table()` - Dynamic batch_size calculation
 - `ingest.py` - Configuration example
 
+
+
+
+
+
+
+

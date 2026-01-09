@@ -98,3 +98,10 @@ The test will show whether `$0` or `$1` indexing works with your pg8000 version.
 - Workaround: Use 0-based indexing for pg8000.native specifically
 - Alternative: Use pg8000's regular (non-native) cursor API which follows standard DB-API 2.0
 
+
+
+
+
+
+
+

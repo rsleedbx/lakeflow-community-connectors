@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ################################################################################
 # CockroachDB Local Setup Diagnostic Script
 #

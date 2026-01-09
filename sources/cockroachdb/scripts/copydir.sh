@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Deploy CockroachDB connector to Databricks workspace
 # Usage: ./copydir.sh (from sources/cockroachdb directory)
 #    or: ./sources/cockroachdb/scripts/copydir.sh (from repo root)
@@ -64,13 +64,8 @@ cp -v pipeline/ingestion_pipeline.py "$TEMP_DIR/pipeline/"
 cp -v sources/$SOURCE_NAME/ingest.py "$TEMP_DIR/ingest.py"
 cp -v sources/$SOURCE_NAME/${SOURCE_NAME}.py "$TEMP_DIR/sources/$SOURCE_NAME/"
 
-# Copy vendor directory with pg8000 and dependencies
-if [ -d "sources/$SOURCE_NAME/vendor" ]; then
-  echo "Copying vendor directory (pg8000 and dependencies)..."
-  cp -rv sources/$SOURCE_NAME/vendor "$TEMP_DIR/sources/$SOURCE_NAME/"
-else
-  echo "⚠️  Warning: vendor directory not found. pg8000 may not be available."
-fi
+# Note: pg8000 is now installed via pipeline libraries (requirements.txt)
+# No need to vendor or copy dependencies manually
 
 # Sync to Databricks workspace
 echo ""

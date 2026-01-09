@@ -1,0 +1,89 @@
+# Databricks Asset Bundle for CockroachDB Connector
+bundle:
+  name: cockroachdb_connector
+
+# Sync pattern: include all necessary files
+sync:
+  include:
+    - "*.py"
+    - "*.md"
+    - "vendor/**"
+    - "configs/**"
+    - "scripts/**"
+  exclude:
+    - "test/**"
+    - "learnings/**"
+    - "__pycache__/**"
+    - "*.pyc"
+
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: main
+  
+  schema_name:
+    description: Schema name for output tables
+    default: ${workspace.current_user.short_name}_cockroachdb_cdc
+  
+  connection_name:
+    description: Unity Catalog connection name for CockroachDB
+    default: ${workspace.current_user.short_name}_battle-walrus-11108
+  
+  table_list:
+    description: Comma-separated list of tables to ingest
+    default: usertable
+
+targets:
+  e2dogfood:
+    mode: development
+    default: true
+    workspace:
+      host: https://e2-dogfood.staging.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/community_connectors/cockroachdb
+    permissions:
+      - level: CAN_MANAGE
+        user_name: ${workspace.current_user.userName}
+      - level: CAN_RUN
+        group_name: users # This grants CAN_RUN permission to all workspace users  
+
+  azurefe:
+    mode: development
+    default: false
+    workspace:
+      host: https://adb-984752964297111.11.azuredatabricks.net
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/community_connectors/cockroachdb
+    permissions:
+      - level: CAN_MANAGE
+        user_name: ${workspace.current_user.userName}
+      - level: CAN_RUN
+        group_name: users # This grants CAN_RUN permission to all workspace users  
+
+  production:
+    mode: production
+    variables:
+      schema_name: cockroachdb_production
+
+resources:
+  pipelines:
+    cockroachdb_pipeline:
+      name: ${workspace.current_user.short_name}_cockroachdb
+      
+      catalog: ${var.catalog}
+      target: ${var.schema_name}
+      
+      channel: PREVIEW
+      serverless: true
+      development: true
+      
+      configuration:
+        connection_name: ${var.connection_name}
+        source_name: cockroachdb
+        table_list: ${var.table_list}
+      
+      libraries:
+        - file:
+            path: ./ingest.py
+      
+      environment:
+        dependencies:
+          - pg8000

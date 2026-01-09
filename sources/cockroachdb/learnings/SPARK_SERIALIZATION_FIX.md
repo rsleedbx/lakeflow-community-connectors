@@ -166,7 +166,7 @@ def read_table(self, ...):
 ## 🔗 **Related Issues**
 
 - **SSL Certificate Fix**: [SSL_CERTIFICATE_FIX.md](SSL_CERTIFICATE_FIX.md)
-- **Connection Credentials**: [HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md)
+- **Unity Catalog Connections**: [HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md) - channel=preview required
 - **Nullsource Serialization**: Similar issue found and fixed in nullsource connector (Pydantic/dataclass serialization)
 
 ## 📊 **Pipeline Status**

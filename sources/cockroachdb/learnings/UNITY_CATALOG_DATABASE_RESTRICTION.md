@@ -201,7 +201,7 @@ pipeline_spec = {
 
 ## 🔗 **Related**
 
-- **Connection Parameters**: [HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md)
+- **Unity Catalog Connections**: [HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md) - channel=preview required
 - **SSL Configuration**: [SSL_CERTIFICATE_FIX.md](SSL_CERTIFICATE_FIX.md)
 - **Spark Serialization**: [SPARK_SERIALIZATION_FIX.md](SPARK_SERIALIZATION_FIX.md)
 

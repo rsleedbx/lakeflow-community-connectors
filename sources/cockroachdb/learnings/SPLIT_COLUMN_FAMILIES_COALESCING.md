@@ -343,3 +343,10 @@ return flatten(coalesced)
 - DLT Docs: [apply_changes()](https://docs.databricks.com/delta-live-tables/python-ref.html#apply-changes)
 - Dynamic Batch Sizing: `DYNAMIC_BATCH_SIZE.md`
 
+
+
+
+
+
+
+

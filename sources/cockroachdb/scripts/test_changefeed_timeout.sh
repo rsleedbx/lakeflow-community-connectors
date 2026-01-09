@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Test changefeed timeout behavior with cursor (no changes)
 
 export COCKROACHDB_URL="postgresql://rslee:W5oTzuQNgpOR2KpQBljdCQ@battle-walrus-11108.jxf.gcp-us-east1.cockroachlabs.cloud:26257/ycsb?sslmode=require"
@@ -73,4 +73,7 @@ echo "- Socket timeout interfering"
 echo "- Statement timeout too aggressive"
 echo "- Connection pooling issue"
 echo ""
+
+
+
 

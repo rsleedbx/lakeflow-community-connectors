@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Setup new CockroachDB pipeline with CDC mode (ingestion_type='cdc')
 # This creates a FRESH pipeline to avoid migration issues from 'snapshot' to 'cdc'
 #

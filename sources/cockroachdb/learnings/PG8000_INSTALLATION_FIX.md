@@ -1,6 +1,25 @@
 # PG8000 Auto-Installation in Databricks Serverless
 
-## Problem Statement
+> 🎉 **UPDATE**: With **Databricks Asset Bundles**, all this complexity is NO LONGER NEEDED!
+> 
+> Simply specify in `databricks.yml`:
+> ```yaml
+> environment:
+>   dependencies:
+>     - pg8000>=1.30.0
+> ```
+> 
+> Databricks handles installation automatically. **No vendoring required!**
+> 
+> See [DATABRICKS_BUNDLE_DEPLOYMENT.md](../DATABRICKS_BUNDLE_DEPLOYMENT.md) for the modern approach.
+> 
+> ---
+> 
+> The content below documents the **legacy vendoring approach** (only needed if not using bundles).
+
+---
+
+## Problem Statement (Legacy Approach)
 
 The CockroachDB connector requires `pg8000` (pure Python PostgreSQL driver) to avoid psycopg2/libpq SSL certificate permission issues in Databricks serverless environments.
 

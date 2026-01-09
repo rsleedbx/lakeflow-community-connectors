@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Helper script to run pytest with correct PYTHONPATH
 # Usage: ./run_pytest.sh
 

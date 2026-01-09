@@ -12,3 +12,15 @@ htmlcov/
 **/configs/*_config.json
 !**/configs/example_config.json
 
+# Credentials and secrets (all sources)
+sources/*/*.env
+sources/*/credentials.*
+sources/*/secrets.*
+sources/*/test_credentials.json
+sources/**/manual_setup_test.sh
+**/cockroachdb_cdc_*.env
+*.env
+
+# Local cache directories (test data)
+.cache/
+

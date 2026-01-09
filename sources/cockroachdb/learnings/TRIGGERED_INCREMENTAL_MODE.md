@@ -237,3 +237,10 @@ For triggered mode, we use `ingestion_type='snapshot'` (not `'cdc'`):
 
 Perfect for **scheduled batch CDC pipelines** that run every 15-60 minutes!
 
+
+
+
+
+
+
+

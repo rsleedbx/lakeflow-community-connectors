@@ -167,12 +167,81 @@ def register_lakeflow_source(spark):
     # sources/cockroachdb/cockroachdb.py
     ########################################################
 
+    try:
+        from pyspark.sql.types import (
+            StructType, StructField, StringType, LongType, IntegerType,
+            DoubleType, BooleanType, DateType, TimestampType, BinaryType,
+            DecimalType, ArrayType
+        )
+        PYSPARK_AVAILABLE = True
+    except ImportError:
+        PYSPARK_AVAILABLE = False
+        # Define stub types for non-Databricks environments
+        StructType = type('StructType', (), {})
+        StructField = type('StructField', (), {})
+        StringType = type('StringType', (), {})
+        LongType = type('LongType', (), {})
+        IntegerType = type('IntegerType', (), {})
+        DoubleType = type('DoubleType', (), {})
+        BooleanType = type('BooleanType', (), {})
+        DateType = type('DateType', (), {})
+        TimestampType = type('TimestampType', (), {})
+        BinaryType = type('BinaryType', (), {})
+        DecimalType = type('DecimalType', (), {})
+        ArrayType = type('ArrayType', (), {})
+
+
     class LakeflowConnect:
-        """CockroachDB connector using sinkless changefeeds for CDC."""
+        """
+        CockroachDB connector with tri-mode operation:
+
+        Mode 1: Direct sinkless changefeed (testing/development)
+        Mode 2: Azure Parquet changefeed (production CDC)
+        Mode 3: Unity Catalog Volume (local testing with pre-synced files)
+
+        CockroachDB CDC Format Support:
+        ===============================
+
+        Parquet Format (Native CockroachDB):
+        - Uses __crdb__event_type column to indicate operation:
+          * 'c' = snapshot/change (used for BOTH initial snapshots AND updates - indistinguishable by type)
+          * 'i' = insert (new row from CDC)
+          * 'd' = delete (removed row from CDC)
+          * NOTE: No 'u' event type exists in Parquet - updates also use 'c'
+        - Data columns are at the top level (not nested)
+        - Includes __crdb__updated timestamp
+        - Works for both snapshot AND CDC events
+        - UPDATE DETECTION: Uses timestamp-based logic to distinguish snapshots from updates:
+          * Events with __crdb__updated <= snapshot_cutoff_timestamp = SNAPSHOT
+          * Events with __crdb__updated > snapshot_cutoff_timestamp = UPDATE
+          * Snapshot cutoff is captured when changefeed is created/first run
+
+        JSON Format (Wrapped Envelope):
+        - Uses 'before' and 'after' columns
+        - 'after' only = snapshot or insert
+        - 'after' + 'before' = update
+        - 'before' only = delete
+
+        Important: CDC File Flush Timing
+        ================================
+        - Snapshot files: Appear within 30 seconds
+        - CDC files: Appear after 60+ seconds (batched by time and size)
+        - Must wait at least 60 seconds after workload for CDC files to flush
+        - Both JSON and Parquet follow similar flush patterns
+
+        Testing Results (December 22, 2025):
+        - All format/table/split_column_families combinations work correctly
+        - 100% success rate (6/6 valid tests passed)
+        - See CDC_TEST_MATRIX_RESULTS.md for detailed analysis
+        """
 
         # Class variable to share snapshot timestamp across tables in multi-table pipelines
         # This ensures all tables use the same timestamp for snapshot consistency
         _shared_snapshot_timestamp = None
+
+        # Class variable to cache column family detection results per table
+        # Format: {(schema, table_name): has_multiple_families}
+        _column_family_cache = {}
 
         def __init__(self, options: Dict[str, str]) -> None:
             """
@@ -193,69 +262,106 @@ def register_lakeflow_source(spark):
                 - user: Username
                 - password: Password (can be empty for insecure mode)
                 - sslmode: SSL mode (default: 'require')
-                - schema: Schema name (default: 'public')
+
+            REQUIRED Parameters (for multi-database deployments):
+                - catalog: Database/catalog name (e.g., 'ecommerce', 'warehouse')
+                - schema: Schema name (e.g., 'public', 'staging')
+
+            Optional Parameters:
+                - format: Changefeed format ('parquet', 'json', or 'both', default: 'parquet')
+
+            Tri-Mode Operation:
+
+            - Direct Mode: Only CockroachDB credentials provided
+              Uses sinkless changefeed for immediate data streaming
+
+            - Azure Parquet/JSON Mode: Azure credentials also provided
+              Creates changefeed to Azure Blob Storage (Parquet and/or JSON format)
+              Reads files back from Azure for production performance
+
+            - Volume Mode: volume_path provided
+              Reads pre-synced files from Unity Catalog Volume
             """
             # Note: We do NOT create a connection in __init__ to avoid Spark serialization issues
             # Connection will be created lazily in methods that need it
 
-            # Debug: Print what options we actually receive from Unity Catalog
-            print("=" * 80)
-            print("🔍 DEBUG: CockroachDB Connector __init__ called")
-            print("=" * 80)
-            print(f"Options received from Spark/Unity Catalog:")
-            print(f"  Total options: {len(options)}")
-            print(f"\nALL OPTIONS (raw dump - this is what Spark passes to the connector):")
-            for key in sorted(options.keys()):
-                # Mask sensitive fields for security
-                if any(sensitive in key.lower() for sensitive in ["password", "token"]):
-                    value = "***REDACTED***"
-                else:
-                    value = repr(options[key])
-                print(f"  {key}: {value}")
-            print("=" * 80)
-            print(f"\nLooking for credentials in options...")
-            print(f"  Has 'token'? {('token' in options)}")
-            print(f"  Has 'base_url'? {('base_url' in options)}")
-            print(f"  Has 'host'? {('host' in options)}")
-            print("=" * 80)
+            # Catalog and Schema for namespace isolation (optional for utility-only usage)
+            self.catalog = options.get('catalog', 'defaultdb')
+            self.schema = options.get('schema', 'public')
 
-            # Schema from connection (fixed by Unity Catalog)
-            self.schema = options.get("schema", "public")
+            # Warn if missing (but don't fail - allows utility method usage)
+            if 'catalog' not in options or 'schema' not in options:
+                import warnings
+                if options:  # Only warn if options were provided (not empty dict)
+                    warnings.warn(
+                        "catalog/schema not specified - using defaults. "
+                        "Specify 'catalog' and 'schema' for production use.",
+                        UserWarning
+                    )
 
-            # Try different credential modes
+            # Format selection: 'parquet' (default), 'json', or 'both'
+            self.format = options.get('format', 'parquet').lower()
+            if self.format not in ['parquet', 'json', 'both']:
+                raise ValueError(f"Invalid format '{self.format}'. Must be 'parquet', 'json', or 'both'.")
+
+            # Parse connection credentials
             token = options.get("token")
             base_url = options.get("base_url")
 
             if token and base_url:
-                print(f"✓ Mode 1: GitHub-style parameters (token + base_url)")
-                print(f"  token: {token.split(':')[0]}:*** (username:password)")
-                print(f"  base_url: {base_url}")
-                print(f"  Reconstructing full connection URL...")
-
+                # GitHub-style: token + base_url
                 if base_url.startswith("postgresql://"):
                     full_url = f"postgresql://{token}@{base_url[13:]}"
-                    print(f"  Reconstructed URL: postgresql://{token.split(':')[0]}:***@{base_url[13:]}")
                     self._parse_connection_url(full_url)
                 else:
-                    print(f"  ❌ Unexpected base_url format: {base_url}")
                     raise ValueError(f"Invalid base_url format: {base_url}")
-
             elif options.get("host"):
-                print("✓ Mode 2: Individual parameters (local testing mode)")
+                # Individual parameters
                 self.host = options.get("host")
                 self.port = int(options.get("port", "26257"))
                 self.database = options.get("database")
                 self.user = options.get("user")
                 self.password = options.get("password", "")
                 self.sslmode = options.get("sslmode", "require")
-
             else:
-                print("❌ No recognized connection parameters found!")
+                # No credentials provided
                 self.host = None
                 self.database = None
                 self.user = None
 
-            print(f"  Note: Connection will be created lazily when needed (not in __init__)")
+            # Detect Volume path for volume-based reading
+            self.volume_path = options.get("volume_path")
+
+            # Detect Azure credentials for dual-mode operation
+            self.azure_account_name = options.get("azure_account_name")
+            self.azure_account_key = options.get("azure_account_key")
+            self.azure_container = options.get("azure_container")
+
+            # Auto-construct storage paths using format-first hierarchy
+            self._setup_storage_paths(options)
+
+            # Determine operation mode (priority: volume > azure > direct)
+            if self.volume_path:
+                self.mode = "volume"
+                print(f"Mode: Volume | Path: {self.volume_path}")
+            elif self.azure_account_name and self.azure_account_key and self.azure_container:
+                # Mode name depends on format
+                if self.format == 'both':
+                    self.mode = "azure_dual"
+                    print(f"Mode: Azure Dual (JSON+Parquet) | Container: {self.azure_container}")
+                elif self.format == 'json':
+                    self.mode = "azure_json"
+                    print(f"Mode: Azure JSON | Container: {self.azure_container}")
+                else:
+                    self.mode = "azure_parquet"
+                    print(f"Mode: Azure Parquet | Container: {self.azure_container}")
+            else:
+                self.mode = "direct"
+                print(f"Mode: Direct Sinkless | Database: {self.database}")
+
+            # Instance variable to track snapshot cutoff timestamp for UPDATE detection in Parquet
+            # Format: {table_name: cutoff_timestamp}
+            self._snapshot_cutoff_timestamps = {}
 
         def _parse_connection_url(self, url: str) -> None:
             """Parse PostgreSQL connection URL into individual components."""
@@ -273,34 +379,45 @@ def register_lakeflow_source(spark):
             query_params = parse_qs(parsed.query)
             self.sslmode = query_params.get("sslmode", ["require"])[0]
 
-            print(f"  Parsed from connection_url:")
-            print(f"    host: {self.host}")
-            print(f"    port: {self.port}")
-            print(f"    database: {self.database}")
-            print(f"    user: {self.user}")
-            print(f"    password: {'***' if self.password else '(empty)'}")
-            print(f"    sslmode: {self.sslmode}")
+        def _setup_storage_paths(self, options: Dict[str, str]) -> None:
+            """
+            Setup format-specific storage paths using format-first hierarchy.
+
+            Storage structure:
+                {format}/{catalog}/{schema}/{table}/YYYY-MM-DD/files
+
+            Examples:
+                parquet/ecommerce/public/orders/2025-12-23/...
+                json/ecommerce/public/orders/2025-12-23/...
+            """
+            base_path = f"{self.catalog}/{self.schema}"
+
+            if self.format == 'both':
+                # Create paths for both formats
+                self.json_path_prefix = f"json/{base_path}"
+                self.parquet_path_prefix = f"parquet/{base_path}"
+                self.azure_path_prefix = None  # Will use format-specific paths
+            elif self.format == 'json':
+                self.azure_path_prefix = f"json/{base_path}"
+                self.json_path_prefix = self.azure_path_prefix
+                self.parquet_path_prefix = None
+            else:  # parquet
+                self.azure_path_prefix = f"parquet/{base_path}"
+                self.parquet_path_prefix = self.azure_path_prefix
+                self.json_path_prefix = None
+
+        def _get_fully_qualified_table(self, table_name: str) -> str:
+            """Return fully qualified table name: catalog.schema.table"""
+            return f"{self.catalog}.{self.schema}.{table_name}"
 
         def _get_connection(self, table_options: Dict[str, str] = None):
             """Create and return a new connection to CockroachDB.
 
             Uses pg8000 (pure Python PostgreSQL driver) to avoid psycopg2/libpq SSL issues.
-            pg8000 is vendored (bundled) directly in the connector directory.
+            pg8000 is installed as a regular Python dependency via requirements.txt.
             """
             try:
-                # Add vendor directory to sys.path to find pg8000 and its dependencies
-                import sys
-                import os
-                vendor_dir = os.path.join(os.path.dirname(__file__), 'vendor')
-                if vendor_dir not in sys.path:
-                    sys.path.insert(0, vendor_dir)
-                    print(f"📦 Added vendor directory to path: {vendor_dir}")
-
-                # LAZY IMPORT: Import pg8000 here (not at module level for Spark serialization)
                 import pg8000
-
-                print(f"\n🔍 DEBUG: Creating connection using pg8000...")
-                print(f"  host={self.host}, port={self.port}, database={self.database}")
 
                 # Create SSL context that doesn't verify certificates
                 # This avoids the /root/.postgresql/ permission issues with psycopg2
@@ -316,18 +433,7 @@ def register_lakeflow_source(spark):
                     database=self.database,
                     ssl_context=ssl_context
                 )
-
-                print("✅ Connected using pg8000 (pure Python driver)")
                 return conn
-
-            except ImportError as e:
-                raise ConnectionError(
-                    f"Failed to import pg8000 from vendored directory.\n\n"
-                    f"pg8000 and dependencies should be in: {vendor_dir}\n"
-                    f"Error: {str(e)}\n\n"
-                    f"This indicates the vendor directory was not uploaded correctly.\n"
-                    f"Please ensure copydir.sh includes the vendor/ directory."
-                )
             except Exception as e:
                 raise ConnectionError(f"Failed to connect to CockroachDB: {str(e)}")
 
@@ -430,6 +536,57 @@ def register_lakeflow_source(spark):
                 print(f"⚠️  Warning: Unknown CockroachDB type '{data_type}', mapping to StringType.")
                 return StringType()
 
+        def _has_multiple_column_families(self, table_name: str, table_options: Dict[str, str] = None) -> bool:
+            """
+            Check if a table has multiple column families by analyzing SHOW CREATE TABLE.
+
+            Results are cached in class variable to avoid repeated queries.
+
+            Args:
+                table_name: Name of the table to check
+                table_options: Optional connection parameters
+
+            Returns:
+                True if table has multiple column families, False otherwise
+            """
+            # Check cache first
+            cache_key = (self.schema, table_name)
+            if cache_key in LakeflowConnect._column_family_cache:
+                return LakeflowConnect._column_family_cache[cache_key]
+
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                # Get the CREATE TABLE statement
+                target = f"{self.schema}.{table_name}" if self.schema != 'public' else table_name
+                cursor.execute(f"SHOW CREATE TABLE {target}")
+                result = cursor.fetchone()
+
+                if not result or len(result) < 2:
+                    cursor.close()
+                    conn.close()
+                    LakeflowConnect._column_family_cache[cache_key] = False
+                    return False
+
+                create_statement = result[1]
+                family_count = create_statement.upper().count('FAMILY ')
+                has_multiple = family_count > 1
+
+                cursor.close()
+                conn.close()
+
+                LakeflowConnect._column_family_cache[cache_key] = has_multiple
+                return has_multiple
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                LakeflowConnect._column_family_cache[cache_key] = False
+                return False
+
         def read_table_metadata(
             self, table_name: str, table_options: Dict[str, str]
         ) -> Dict[str, Any]:
@@ -469,7 +626,27 @@ def register_lakeflow_source(spark):
         def read_table(
             self, table_name: str, start_offset: Dict[str, str], table_options: Dict[str, str]
         ) -> Iterator[Dict[str, Any]]:
-            """Read data from a CockroachDB table using changefeeds."""
+            """
+            Read data from a CockroachDB table.
+
+            Routes to one of three modes based on configuration:
+            - volume: Read Parquet files from Databricks Volume
+            - azure_parquet: Read from Azure Blob Storage via changefeed
+            - direct: Direct sinkless changefeed connection
+            """
+            print(f"Reading table: {table_name} (mode={self.mode}, cursor={start_offset.get('cursor') if start_offset else None})")
+
+            if self.mode == "volume":
+                return self._read_table_from_volume(table_name, start_offset, table_options)
+            elif self.mode == "azure_parquet":
+                return self._read_table_from_azure_parquet(table_name, start_offset, table_options)
+            else:
+                return self._read_table_direct(table_name, start_offset, table_options)
+
+        def _read_table_direct(
+            self, table_name: str, start_offset: Dict[str, str], table_options: Dict[str, str]
+        ) -> Iterator[Dict[str, Any]]:
+            """Read data from a CockroachDB table using direct sinkless changefeeds."""
             import time
 
             if table_name not in self.list_tables(table_options):
@@ -501,7 +678,19 @@ def register_lakeflow_source(spark):
                 changefeed_options.append("updated")
                 changefeed_options.append(f"resolved='{resolved_interval}'")
 
-            changefeed_options.append("split_column_families")
+            # Check if table has multiple column families (before creating connection for changefeed)
+            # This must be done before _get_connection for changefeed to avoid connection reuse issues
+            temp_conn_for_check = self._get_connection(table_options)
+            try:
+                has_multiple_families = self._has_multiple_column_families(table_name, table_options)
+            finally:
+                temp_conn_for_check.close()
+
+            if has_multiple_families:
+                changefeed_options.append("split_column_families")
+                print(f"   ✅ Added split_column_families (table has multiple column families)")
+            else:
+                print(f"   ℹ️  Skipped split_column_families (table has single column family)")
 
             if cursor and effective_initial_scan.lower() != "only":
                 changefeed_options.append(f"cursor='{cursor}'")
@@ -512,23 +701,25 @@ def register_lakeflow_source(spark):
 
             conn = self._get_connection(table_options)
 
-            # Capture timestamp for multi-table consistency
+            # Capture current timestamp for cursor tracking
+            debug_cursor = self._create_cursor(conn)
+            debug_cursor.execute("SELECT cluster_logical_timestamp()::string")
+            current_ts = debug_cursor.fetchone()[0]
+            debug_cursor.close()
+
+            # For snapshot mode: handle multi-table consistency
             if effective_initial_scan.lower() == "only":
                 is_multi_table = table_options.get("multi_table_pipeline", "false").lower() == "true"
 
-                debug_cursor = self._create_cursor(conn)
-                debug_cursor.execute("SELECT cluster_logical_timestamp()::string")
-                current_ts = debug_cursor.fetchone()[0]
-                debug_cursor.close()
-
                 if is_multi_table and LakeflowConnect._shared_snapshot_timestamp:
                     self._snapshot_start_timestamp = LakeflowConnect._shared_snapshot_timestamp
-                    print(f"\n💡 Reusing shared snapshot timestamp: {self._snapshot_start_timestamp}")
                 else:
                     self._snapshot_start_timestamp = current_ts
-                    print(f"\n💡 Captured snapshot start timestamp: {current_ts}")
                     if is_multi_table:
                         LakeflowConnect._shared_snapshot_timestamp = current_ts
+            else:
+                # For incremental mode: save timestamp to move cursor forward even if no changes
+                self._incremental_run_timestamp = current_ts
 
             def event_generator():
                 """Generator that yields changefeed events."""
@@ -544,12 +735,11 @@ def register_lakeflow_source(spark):
 
                 try:
                     changefeed_cursor.execute(f"SET statement_timeout = '{query_timeout}'")
-                except Exception as e:
-                    print(f"  ⚠️  Warning: Could not set statement_timeout: {e}")
+                except Exception:
+                    pass  # Ignore timeout setting errors
 
                 try:
                     changefeed_cursor.execute(changefeed_query)
-                    print(f"✅ Query submitted")
                 except Exception as e:
                     # Check for timeout
                     try:
@@ -569,14 +759,12 @@ def register_lakeflow_source(spark):
                     )
 
                     if is_statement_timeout:
-                        print(f"\n✅ Changefeed timed out (EXPECTED - no changes)")
                         try:
                             changefeed_cursor.close()
                         except:
                             pass
                         return cursor
                     else:
-                        print(f"\n❌ Unexpected error: {e}")
                         try:
                             changefeed_cursor.close()
                         except:
@@ -602,7 +790,6 @@ def register_lakeflow_source(spark):
                             if key_json is None and value_json is None:
                                 last_resolved = updated
                                 if cursor is not None:
-                                    print(f"   ✅ Caught up at: {last_resolved}")
                                     break
                                 continue
                         else:
@@ -648,15 +835,13 @@ def register_lakeflow_source(spark):
                         (is_pg8000_error and '57014' in error_dict)
                     )
 
-                    if is_timeout:
-                        print(f"\n⏰ Query timed out (EXPECTED)")
-                    else:
-                        print(f"\n❌ Error: {e}")
+                    if not is_timeout:
                         try:
                             changefeed_cursor.close()
                         except:
                             pass
                         raise
+                    # If timeout, continue (expected behavior for incremental CDC)
                 finally:
                     try:
                         changefeed_cursor.close()
@@ -679,21 +864,22 @@ def register_lakeflow_source(spark):
             finally:
                 conn.close()
 
+            # Coalesce fragmented events (from split_column_families) into complete rows
+            coalesce_enabled = table_options.get("coalesce_split_families", "false").lower() == "true"
+            if coalesce_enabled and events:
+                events = self._coalesce_events_by_key(events)
+
             end_offset = start_offset.copy() if start_offset else {}
 
             if last_resolved:
+                # CDC returned a resolved timestamp (changes detected and processed)
                 end_offset["cursor"] = last_resolved
             elif hasattr(self, '_snapshot_start_timestamp') and self._snapshot_start_timestamp:
+                # Snapshot mode: use the snapshot start timestamp
                 end_offset["cursor"] = self._snapshot_start_timestamp
-
-            # Print manual test command
-            if end_offset.get("cursor"):
-                print(f"💡 Manual Test:")
-                print(f"psql $COCKROACHDB_URL << 'EOF'")
-                print(f"EXPERIMENTAL CHANGEFEED FOR {table_name}")
-                print(f"  WITH initial_scan='no', updated, resolved='1s',")
-                print(f"       split_column_families, cursor='{end_offset['cursor']}';")
-                print(f"EOF")
+            elif hasattr(self, '_incremental_run_timestamp') and self._incremental_run_timestamp:
+                # Incremental mode with no changes: move cursor forward to current timestamp
+                end_offset["cursor"] = self._incremental_run_timestamp
 
             return iter(events), end_offset
 
@@ -701,7 +887,13 @@ def register_lakeflow_source(spark):
             self, key: list, value: Dict, updated: str
         ) -> Dict:
             """Transform CockroachDB changefeed event."""
-            result = value.copy() if value else {}
+            # CockroachDB changefeeds return: {"after": {"col1": "val1", ...}}
+            # Extract the "after" object which contains the actual column values
+            if value and "after" in value:
+                result = value["after"].copy()
+            else:
+                result = value.copy() if value else {}
+
             result["_cdc_key"] = key
 
             if updated is None:
@@ -716,6 +908,1580 @@ def register_lakeflow_source(spark):
                 result["_cdc_operation"] = "UPSERT"
 
             return result
+
+        def _coalesce_events_by_key(self, events: List[Dict]) -> List[Dict]:
+            # NOTE: This method is duplicated in both files for testing purposes
+            """
+            Coalesce fragmented events (from split_column_families) into complete rows.
+
+            With split_column_families=true, CockroachDB emits multiple events per row
+            (one per column family). This method merges them by primary key using
+            last-non-null semantics for each field.
+
+            Args:
+                events: List of fragmented changefeed events
+
+            Returns:
+                List of complete, merged rows
+            """
+            from collections import defaultdict
+
+            # Handle two types of _cdc_key:
+            # 1. Simple list of values (from direct mode): ['pk_value']
+            # 2. List of (col, val) tuples (from Parquet split_column_families): [('ycsb_key', 'value'), ('field0', 'x')]
+
+            # For Parquet format, we need to extract only PK columns (columns present in all events)
+            # by finding the intersection of column names
+            sample_key = events[0].get("_cdc_key", []) if events else []
+            is_tuple_format = sample_key and isinstance(sample_key[0], tuple)
+
+            if is_tuple_format:
+                # Find columns that appear in ALL events (these are PK columns)
+                all_columns = None
+                for event in events:
+                    cdc_key = event.get("_cdc_key", [])
+                    event_columns = set(col for col, _ in cdc_key)
+                    if all_columns is None:
+                        all_columns = event_columns
+                    else:
+                        all_columns = all_columns.intersection(event_columns)
+
+                pk_columns = sorted(all_columns) if all_columns else []
+
+                # Group by PK columns only
+                key_to_events = defaultdict(list)
+                for event in events:
+                    cdc_key = event.get("_cdc_key", [])
+                    # Extract only PK column values in sorted order
+                    pk_values = tuple(val for col, val in sorted(cdc_key) if col in pk_columns)
+                    key_to_events[pk_values].append(event)
+            else:
+                # Simple list format (direct mode)
+                key_to_events = defaultdict(list)
+                for event in events:
+                    key_tuple = tuple(event.get("_cdc_key", []))
+                    key_to_events[key_tuple].append(event)
+
+            # Merge events for each key
+            coalesced = []
+            for key_tuple, key_events in key_to_events.items():
+                merged = {}
+
+                # Take last non-null value for each field
+                for event in key_events:
+                    for field, value in event.items():
+                        if value is not None:
+                            merged[field] = value
+
+                coalesced.append(merged)
+
+            return coalesced
+
+        # ========================================================================
+        # Volume Mode Implementation
+        # ========================================================================
+
+        def _read_table_from_volume(
+            self, table_name: str, start_offset: Dict[str, str], table_options: Dict[str, str]
+        ) -> Iterator[Dict[str, Any]]:
+            """
+            Read table data from Databricks Unity Catalog Volume.
+
+            Flow:
+            1. List Parquet files in Volume (using dbutils or Spark)
+            2. Filter files by cursor (filename-based, has embedded timestamp)
+            3. Read each Parquet file using Spark
+            4. Transform CDC format (extract 'after', add metadata)
+            5. Yield rows to Spark
+            6. Update cursor to latest file processed
+
+            Cursor Strategy:
+            - Parquet filenames contain timestamp prefix (e.g., 202512191714242809831900000000000-...)
+            - Sort files by name (timestamp order)
+            - Track last processed filename as cursor
+            - Process only files > cursor
+
+            Snapshot vs CDC:
+            - All events treated uniformly (no explicit snapshot/CDC distinction in Parquet)
+            - Rely on 'updated' timestamp for ordering
+            - Both snapshot and CDC events come through same file stream
+            """
+            from pyspark.sql import SparkSession
+            import pyarrow.parquet as pq
+
+            spark = SparkSession.builder.getOrCreate()
+            last_cursor = start_offset.get("cursor", "") if start_offset else ""
+
+            try:
+                # Use dbutils to list files (works in Databricks)
+                files = spark._jvm.com.databricks.dbutils_v1.DBUtilsHolder.dbutils().fs().ls(self.volume_path)
+
+                # Convert Java collection to Python list
+                file_list = []
+                for file_info in files:
+                    name = file_info.name()
+                    if name.endswith('.parquet'):
+                        file_list.append({
+                            'name': name,
+                            'path': file_info.path(),
+                            'size': file_info.size()
+                        })
+
+            except Exception as e:
+                # Fallback: use Spark to list files
+                try:
+                    file_df = spark.read.format("binaryFile").load(self.volume_path)
+                    file_list = [
+                        {
+                            'name': row.path.split('/')[-1],
+                            'path': row.path,
+                            'size': row.length
+                        }
+                        for row in file_df.select("path", "length").collect()
+                        if row.path.endswith('.parquet')
+                    ]
+                except Exception as e2:
+                    return iter([]), start_offset
+
+            # Filter and sort files by cursor
+            new_files = [f for f in file_list if f['name'] > last_cursor]
+            new_files.sort(key=lambda f: f['name'])
+
+            if not new_files:
+                return iter([]), start_offset
+
+            # Read and process each Parquet file
+            all_rows = []
+            latest_filename = last_cursor
+
+            for file_info in new_files:
+                filename = file_info['name']
+                file_path = file_info['path']
+
+                try:
+                    # Read Parquet using Spark (handles Volume paths natively)
+                    df = spark.read.parquet(file_path)
+
+                    # Convert to Pandas for easier row-by-row processing
+                    pdf = df.toPandas()
+                    records = pdf.to_dict('records')
+
+                    # Process records using common method
+                    snapshot_cutoff = self._snapshot_cutoff_timestamps.get(table_name)
+                    transformed_records = self._process_parquet_records(
+                        records,
+                        source_file=filename,
+                        fallback_timestamp=None,
+                        snapshot_cutoff=snapshot_cutoff
+                    )
+
+                    all_rows.extend(transformed_records)
+
+                except Exception:
+                    continue
+
+                # Update cursor to this file
+                latest_filename = filename
+
+            # Return data + updated offset
+            end_offset = {"cursor": latest_filename}
+            return iter(all_rows), end_offset
+
+        # ========================================================================
+        # Common Parquet Processing Methods
+        # ========================================================================
+
+        def _determine_cdc_operation(self, event_type: str, event_timestamp: str = None, snapshot_cutoff: str = None) -> str:
+            """
+            Map CockroachDB event type to CDC operation.
+
+            NOTE: For Parquet format, __crdb__event_type is 'c' for both snapshots and 
+            updates (indistinguishable by type alone). Uses timestamp-based logic to distinguish:
+            - Events with timestamp <= snapshot_cutoff = SNAPSHOT
+            - Events with timestamp > snapshot_cutoff = UPDATE
+
+            Args:
+                event_type: CockroachDB event type ('c', 'i', 'd')
+                           Note: 'u' is included for compatibility but does not exist in Parquet format
+                event_timestamp: Optional timestamp from __crdb__updated field
+                snapshot_cutoff: Optional cutoff timestamp (initial scan completion time)
+
+            Returns:
+                CDC operation ('SNAPSHOT', 'INSERT', 'UPDATE', 'DELETE', 'UNKNOWN')
+            """
+            if event_type == 'c':
+                # For 'c' events, use timestamp to distinguish snapshot from update
+                if event_timestamp and snapshot_cutoff:
+                    try:
+                        # Compare timestamps as strings (they're in sortable format)
+                        if event_timestamp > snapshot_cutoff:
+                            return 'UPDATE'
+                    except:
+                        pass
+                # Default to SNAPSHOT if no timestamp logic available
+                return 'SNAPSHOT'
+            elif event_type == 'i':
+                return 'INSERT'
+            elif event_type == 'u':
+                return 'UPDATE'
+            elif event_type == 'd':
+                return 'DELETE'
+            else:
+                return 'UNKNOWN'
+
+        def _process_parquet_records(
+            self, 
+            records: List[Dict[str, Any]], 
+            source_file: str,
+            fallback_timestamp: str = None,
+            snapshot_cutoff: str = None
+        ) -> List[Dict[str, Any]]:
+            """
+            Process Parquet records and transform to CDC format.
+
+            Handles two CockroachDB Parquet formats:
+            1. Native format: __crdb__event_type column with data at top level
+            2. Wrapped format: 'before'/'after' columns (less common for Parquet)
+
+            Args:
+                records: List of records from Parquet file
+                source_file: Source filename for tracking
+                fallback_timestamp: Fallback timestamp if not in record
+                snapshot_cutoff: Optional cutoff timestamp to distinguish snapshots from updates
+                               Events with timestamp > cutoff are considered UPDATEs
+
+            Returns:
+                List of transformed records with CDC metadata
+            """
+            transformed_records = []
+
+            for record in records:
+                # Check for native CockroachDB Parquet format (with __crdb__event_type)
+                if '__crdb__event_type' in record:
+                    # Native format: data columns at top level, event type indicator
+                    event_type = record.get('__crdb__event_type', '')
+                    event_timestamp = record.get('__crdb__updated', record.get('updated'))
+                    cdc_operation = self._determine_cdc_operation(event_type, event_timestamp, snapshot_cutoff)
+
+                    # Extract primary key as column:value pairs (for split_column_families)
+                    # This allows matching rows across files that have different data columns
+                    # We use a sorted tuple of (col, val) pairs for consistent key comparison
+                    cdc_key_pairs = []
+                    for col in sorted(record.keys()):
+                        if not col.startswith('__crdb__') and not col.startswith('_cdc_') and not col.startswith('_source_'):
+                            cdc_key_pairs.append((col, record[col]))
+
+                    # Build transformed record
+                    transformed = {
+                        **record,  # All columns from Parquet (including data)
+                        '_cdc_key': cdc_key_pairs,  # List of (col, val) tuples
+                        '_cdc_updated': record.get('__crdb__updated', record.get('updated', fallback_timestamp)),
+                        '_cdc_operation': cdc_operation,
+                        '_source_file': source_file
+                    }
+
+                else:
+                    # Wrapped format (before/after columns) - less common for Parquet
+                    after_data = record.get('after', {})
+                    before_data = record.get('before', {})
+
+                    # Determine operation
+                    has_after = after_data is not None and (not isinstance(after_data, dict) or len(after_data) > 0)
+                    has_before = before_data is not None and (not isinstance(before_data, dict) or len(before_data) > 0)
+
+                    if has_after and not has_before:
+                        cdc_operation = 'SNAPSHOT'
+                        row_data = after_data if isinstance(after_data, dict) else {}
+                    elif has_after and has_before:
+                        cdc_operation = 'UPDATE'
+                        row_data = after_data if isinstance(after_data, dict) else {}
+                    elif has_before and not has_after:
+                        cdc_operation = 'DELETE'
+                        row_data = before_data if isinstance(before_data, dict) else {}
+                    else:
+                        cdc_operation = 'UNKNOWN'
+                        row_data = {}
+
+                    # Build transformed record
+                    transformed = {
+                        **row_data,
+                        '_cdc_key': record.get('key', []),
+                        '_cdc_updated': record.get('updated', fallback_timestamp),
+                        '_cdc_operation': cdc_operation,
+                        '_source_file': source_file
+                    }
+
+                transformed_records.append(transformed)
+
+            return transformed_records
+
+        # ========================================================================
+        # Azure Parquet Mode Implementation
+        # ========================================================================
+
+        def _read_table_from_azure_parquet(
+            self, table_name: str, start_offset: Dict[str, str], table_options: Dict[str, str]
+        ) -> Iterator[Dict[str, Any]]:
+            """
+            Read table data from Azure Parquet files.
+
+            Flow:
+            1. Ensure changefeed exists to Azure (create if needed)
+            2. List Parquet files in Azure container
+            3. Filter files by cursor (only new files)
+            4. Download and read each Parquet file
+            5. Yield rows to Spark
+            6. Update cursor to latest file timestamp
+            """
+            self._ensure_azure_dependencies()
+            changefeed_job_id, is_newly_created = self._ensure_azure_changefeed(table_name, table_options)
+
+            # If changefeed was newly created, capture snapshot cutoff timestamp
+            # This allows us to distinguish snapshot events from later CDC updates in Parquet format
+            if is_newly_created and table_name not in self._snapshot_cutoff_timestamps:
+                conn = self._get_connection(table_options)
+                try:
+                    cursor = self._create_cursor(conn)
+                    cursor.execute("SELECT cluster_logical_timestamp()::string")
+                    current_ts = cursor.fetchone()[0]
+                    self._snapshot_cutoff_timestamps[table_name] = current_ts
+                    cursor.close()
+                    conn.close()
+                except:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+
+            from azure.storage.blob import BlobServiceClient
+            import time
+
+            blob_service_client = BlobServiceClient(
+                account_url=f"https://{self.azure_account_name}.blob.core.windows.net",
+                credential=self.azure_account_key
+            )
+            container_client = blob_service_client.get_container_client(self.azure_container)
+
+            prefix = f"{self.azure_path_prefix}/"
+            last_cursor = start_offset.get("cursor") if start_offset else None
+
+            # If changefeed was just created, wait for snapshot files to appear
+            if is_newly_created:
+                max_wait_time = 90
+                check_interval = 10
+                elapsed = 0
+
+                while elapsed < max_wait_time:
+                    parquet_files = self._list_azure_parquet_files(
+                        container_client, prefix, last_cursor, table_name
+                    )
+
+                    if parquet_files:
+                        break
+
+                    time.sleep(check_interval)
+                    elapsed += check_interval
+
+                if not parquet_files:
+                    return iter([]), start_offset
+            else:
+                parquet_files = self._list_azure_parquet_files(
+                    container_client, prefix, last_cursor, table_name
+                )
+
+            if not parquet_files:
+                return iter([]), start_offset
+
+            import pyarrow.parquet as pq
+            import io
+
+            all_rows = []
+            latest_timestamp = last_cursor
+
+            for file_info in parquet_files:
+                blob_name = file_info['name']
+                timestamp = file_info['timestamp']
+
+                blob_client = container_client.get_blob_client(blob_name)
+                blob_data = blob_client.download_blob().readall()
+
+                try:
+                    parquet_table = pq.read_table(io.BytesIO(blob_data))
+                    records = parquet_table.to_pandas().to_dict('records')
+
+                    snapshot_cutoff = self._snapshot_cutoff_timestamps.get(table_name)
+                    transformed_records = self._process_parquet_records(
+                        records, 
+                        source_file=blob_name,
+                        fallback_timestamp=timestamp,
+                        snapshot_cutoff=snapshot_cutoff
+                    )
+
+                    all_rows.extend(transformed_records)
+
+                except Exception:
+                    continue
+
+                # Update cursor to highest timestamp
+                if not latest_timestamp or timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+
+            # Return data + updated offset
+            end_offset = {"cursor": latest_timestamp} if latest_timestamp else start_offset
+            return iter(all_rows), end_offset
+
+        def _ensure_azure_changefeed(
+            self, table_name: str, table_options: Dict[str, str]
+        ) -> tuple[str, bool]:
+            """
+            Ensure changefeed(s) exist that write to Azure.
+
+            Based on self.format, creates:
+            - 'parquet': Single Parquet changefeed
+            - 'json': Single JSON changefeed
+            - 'both': Two changefeeds (JSON + Parquet)
+
+            Returns: (changefeed_job_id(s), is_newly_created)
+            """
+            if self.format == 'both':
+                # Create both JSON and Parquet changefeeds
+                json_result = self._create_json_changefeed(table_name, table_options)
+                parquet_result = self._create_parquet_changefeed(table_name, table_options)
+                return (f"{json_result[0]},{parquet_result[0]}", json_result[1] or parquet_result[1])
+            elif self.format == 'json':
+                return self._create_json_changefeed(table_name, table_options)
+            else:  # parquet
+                return self._create_parquet_changefeed(table_name, table_options)
+
+        def _create_parquet_changefeed(
+            self, table_name: str, table_options: Dict[str, str]
+        ) -> tuple[str, bool]:
+            """Create a Parquet-format changefeed."""
+            conn = self._get_connection(table_options)
+            cursor = self._create_cursor(conn)
+
+            try:
+                # Check if Parquet changefeed already exists
+                fq_table = self._get_fully_qualified_table(table_name)
+                existing_job = self._find_existing_changefeed(cursor, table_name, 'parquet')
+                if existing_job:
+                    cursor.close()
+                    conn.close()
+                    return (str(existing_job), False)
+
+                from urllib.parse import quote
+                encoded_key = quote(self.azure_account_key, safe='')
+
+                azure_uri = (
+                    f"azure://{self.azure_container}/{self.parquet_path_prefix}/"
+                    f"?AZURE_ACCOUNT_NAME={self.azure_account_name}"
+                    f"&AZURE_ACCOUNT_KEY={encoded_key}"
+                )
+
+                # Get options
+                initial_scan = table_options.get("initial_scan", "yes")
+
+                # Check if table has multiple column families
+                has_multiple_families = self._has_multiple_column_families(table_name, table_options)
+
+                # Build changefeed options
+                cf_options = []
+                cf_options.append("format = 'parquet'")
+                cf_options.append("compression = 'gzip'")
+
+                # Add CDC options only if not snapshot-only
+                if initial_scan != 'only':
+                    cf_options.append("updated")
+                    cf_options.append("resolved = '10s'")
+
+                if has_multiple_families:
+                    cf_options.append("split_column_families")
+
+                cf_options.append(f"initial_scan = '{initial_scan}'")
+
+                options_str = ",\n                  ".join(cf_options)
+
+                changefeed_sql = f"""
+                    CREATE CHANGEFEED FOR TABLE {fq_table}
+                    INTO '{azure_uri}'
+                    WITH 
+                      {options_str}
+                """
+
+                cursor.execute(changefeed_sql)
+                result = cursor.fetchone()
+                job_id = str(result[0]) if result else None
+
+                cursor.close()
+                conn.close()
+
+                return (job_id, True)
+
+            except Exception as e:
+                try:
+                    cursor.close()
+                except:
+                    pass
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise
+
+        def _create_json_changefeed(
+            self, table_name: str, table_options: Dict[str, str]
+        ) -> tuple[str, bool]:
+            """Create a JSON-format changefeed."""
+            conn = self._get_connection(table_options)
+            cursor = self._create_cursor(conn)
+
+            try:
+                # Check if JSON changefeed already exists
+                fq_table = self._get_fully_qualified_table(table_name)
+                existing_job = self._find_existing_changefeed(cursor, table_name, 'json')
+                if existing_job:
+                    cursor.close()
+                    conn.close()
+                    return (str(existing_job), False)
+
+                from urllib.parse import quote
+                encoded_key = quote(self.azure_account_key, safe='')
+
+                azure_uri = (
+                    f"azure://{self.azure_container}/{self.json_path_prefix}/"
+                    f"?AZURE_ACCOUNT_NAME={self.azure_account_name}"
+                    f"&AZURE_ACCOUNT_KEY={encoded_key}"
+                )
+
+                # Get options
+                initial_scan = table_options.get("initial_scan", "yes")
+
+                # Build changefeed options
+                cf_options = []
+                cf_options.append("format = 'json'")
+                cf_options.append("envelope = 'wrapped'")
+
+                # Add CDC options only if not snapshot-only
+                if initial_scan != 'only':
+                    cf_options.append("diff")
+                    cf_options.append("updated")
+                    cf_options.append("resolved = '10s'")
+
+                cf_options.append(f"initial_scan = '{initial_scan}'")
+
+                options_str = ",\n                  ".join(cf_options)
+
+                changefeed_sql = f"""
+                    CREATE CHANGEFEED FOR TABLE {fq_table}
+                    INTO '{azure_uri}'
+                    WITH 
+                      {options_str}
+                """
+
+                cursor.execute(changefeed_sql)
+                result = cursor.fetchone()
+                job_id = str(result[0]) if result else None
+
+                cursor.close()
+                conn.close()
+
+                return (job_id, True)
+
+            except Exception as e:
+                try:
+                    cursor.close()
+                except:
+                    pass
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise
+
+        def _find_existing_changefeed(self, cursor, table_name: str, format_type: str) -> str:
+            """Find existing changefeed for table and format."""
+            cursor.execute("""
+                SELECT job_id, status, description
+                FROM [SHOW JOBS] 
+                WHERE job_type = 'CHANGEFEED' 
+                  AND status IN ('running', 'pending')
+                ORDER BY created DESC
+                LIMIT 50
+            """)
+
+            jobs = cursor.fetchall()
+            format_prefix = f"{format_type}/{self.catalog}/{self.schema}"
+
+            for job in jobs:
+                job_id, status, description = job
+                desc_str = str(description)
+                if (str(table_name) in desc_str and 
+                    'azure://' in desc_str.lower() and
+                    format_prefix in desc_str):
+                    return str(job_id)
+
+            return None
+
+        def check_changefeed_status(self, job_id: int, table_options: Dict[str, str] = None) -> Dict[str, Any]:
+            """
+            Check the status of a changefeed job.
+
+            Args:
+                job_id: The changefeed job ID to check
+                table_options: Optional connection parameters
+
+            Returns:
+                Dictionary with status information:
+                {
+                    'job_id': int,
+                    'status': str,           # 'running', 'paused', 'failed', etc.
+                    'running_status': str,   # Detailed running status
+                    'error': str,            # Error message if any
+                    'is_healthy': bool,      # True if running without errors
+                    'has_errors': bool       # True if errors detected
+                }
+
+            Raises:
+                ValueError: If job_id not found
+            """
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                cursor.execute(f"""
+                    SELECT status, running_status, error
+                    FROM [SHOW JOBS]
+                    WHERE job_id = {job_id}
+                """)
+
+                result = cursor.fetchone()
+
+                if not result:
+                    cursor.close()
+                    conn.close()
+                    raise ValueError(f"Changefeed job {job_id} not found")
+
+                status, running_status, error = result
+
+                # Check for errors in running_status
+                has_errors = False
+                if running_status:
+                    has_errors = 'error' in str(running_status).lower()
+
+                # Check for errors in error field
+                if error:
+                    has_errors = True
+
+                is_healthy = (status in ('running', 'pending')) and not has_errors
+
+                cursor.close()
+                conn.close()
+
+                return {
+                    'job_id': job_id,
+                    'status': status,
+                    'running_status': running_status,
+                    'error': error,
+                    'is_healthy': is_healthy,
+                    'has_errors': has_errors
+                }
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise
+
+        def get_table_row_count(self, table_name: str, table_options: Dict[str, str] = None) -> int:
+            """
+            Get the number of rows in a table.
+
+            Args:
+                table_name: Name of the table to count
+                table_options: Optional connection parameters
+
+            Returns:
+                Number of rows in the table
+
+            Raises:
+                ValueError: If table doesn't exist
+            """
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                # Use fully qualified table name
+                target = f"{self.schema}.{table_name}" if self.schema != 'public' else table_name
+
+                cursor.execute(f"SELECT COUNT(*) FROM {target}")
+                result = cursor.fetchone()
+
+                count = result[0] if result else 0
+
+                cursor.close()
+                conn.close()
+
+                return count
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise ValueError(f"Failed to get row count for table '{table_name}': {str(e)}")
+
+        def find_changefeeds_for_table(
+            self, 
+            table_name: str, 
+            table_options: Dict[str, str] = None,
+            statuses: List[str] = None
+        ) -> List[Dict[str, Any]]:
+            """
+            Find existing changefeeds for a specific table.
+
+            Args:
+                table_name: Name of the table to search for
+                table_options: Optional connection parameters
+                statuses: List of job statuses to filter by (default: ['running', 'pending', 'paused'])
+
+            Returns:
+                List of dictionaries with changefeed information:
+                [{
+                    'job_id': int,
+                    'status': str,
+                    'running_status': str,
+                    'description': str,
+                    'has_errors': bool
+                }, ...]
+            """
+            if statuses is None:
+                statuses = ['running', 'pending', 'paused']
+
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                # Build status filter
+                status_list = "', '".join(statuses)
+
+                cursor.execute(f"""
+                    SELECT job_id, status, running_status, description
+                    FROM [SHOW JOBS] 
+                    WHERE job_type = 'CHANGEFEED' 
+                    AND description LIKE '%{table_name}%'
+                    AND status IN ('{status_list}')
+                """)
+
+                jobs = cursor.fetchall()
+
+                result = []
+                for job_id, status, running_status, description in jobs:
+                    has_errors = False
+                    if running_status:
+                        has_errors = 'error' in str(running_status).lower()
+
+                    result.append({
+                        'job_id': int(job_id),
+                        'status': status,
+                        'running_status': running_status,
+                        'description': description,
+                        'has_errors': has_errors
+                    })
+
+                cursor.close()
+                conn.close()
+
+                return result
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise
+
+        def create_changefeed_to_azure(
+            self,
+            table_name: str,
+            azure_uri: str,
+            changefeed_format: str = 'parquet',
+            initial_scan: str = 'yes',
+            table_options: Dict[str, str] = None
+        ) -> int:
+            """
+            Create a changefeed that writes to Azure Blob Storage.
+
+            Args:
+                table_name: Name of the table to create changefeed for
+                azure_uri: Azure storage URI (with credentials)
+                changefeed_format: 'parquet' or 'json' (default: 'parquet')
+                initial_scan: 'yes', 'no', or 'only' (default: 'yes')
+                table_options: Optional connection parameters
+
+            Returns:
+                Job ID of the created changefeed
+
+            Raises:
+                Exception: If changefeed creation fails
+            """
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                # Use fully qualified table name
+                target = f"{self.schema}.{table_name}" if self.schema != 'public' else table_name
+
+                # Check if table has multiple column families
+                has_multiple_families = self._has_multiple_column_families(table_name, table_options)
+
+                # Build changefeed SQL based on format
+                if changefeed_format == 'parquet':
+                    options = [
+                        "format = 'parquet'",
+                        "compression = 'gzip'",
+                        f"initial_scan = '{initial_scan}'"
+                    ]
+
+                    # Add CDC options only if not snapshot-only
+                    if initial_scan != 'only':
+                        options.insert(0, "updated")
+                        options.insert(1, "resolved = '1s'")
+
+                    if has_multiple_families:
+                        options.append("split_column_families")
+
+                    options_str = ",\n  ".join(options)
+                    changefeed_sql = f"""
+    CREATE CHANGEFEED FOR TABLE {target}
+    INTO '{azure_uri}'
+    WITH 
+      {options_str}
+    """
+                else:  # json
+                    options = [
+                        "format = 'json'",
+                        "envelope = 'wrapped'",
+                        f"initial_scan = '{initial_scan}'"
+                    ]
+
+                    # Add CDC options only if not snapshot-only
+                    if initial_scan != 'only':
+                        options.insert(0, "updated")
+                        options.insert(1, "diff")  # Include 'before' field for updates
+                        options.insert(2, "resolved = '1s'")
+
+                    if has_multiple_families:
+                        options.append("split_column_families")
+
+                    options_str = ",\n  ".join(options)
+                    changefeed_sql = f"""
+    CREATE CHANGEFEED FOR TABLE {target}
+    INTO '{azure_uri}'
+    WITH 
+      {options_str}
+    """
+
+                cursor.execute(changefeed_sql)
+                result = cursor.fetchone()
+
+                job_id = int(result[0]) if result else None
+
+                cursor.close()
+                conn.close()
+
+                if not job_id:
+                    raise Exception("Failed to create changefeed: no job ID returned")
+
+                return job_id
+
+            except Exception as e:
+                try:
+                    cursor.close()
+                except:
+                    pass
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise Exception(f"Failed to create changefeed: {str(e)}")
+
+        def execute_sql(
+            self,
+            sql: str,
+            commit: bool = False,
+            table_options: Dict[str, str] = None
+        ) -> List[tuple]:
+            """
+            Execute arbitrary SQL query.
+
+            Args:
+                sql: SQL query to execute
+                commit: Whether to commit after execution (for DML)
+                table_options: Optional connection parameters
+
+            Returns:
+                List of result rows (empty for DML statements)
+            """
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                cursor.execute(sql)
+
+                # Try to fetch results (will be empty for DML)
+                try:
+                    results = cursor.fetchall()
+                except:
+                    results = []
+
+                if commit:
+                    conn.commit()
+
+                cursor.close()
+                conn.close()
+
+                return results
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise
+
+        def batch_update_table(
+            self,
+            table_name: str,
+            updates: List[Dict[str, Any]],
+            batch_size: int = 500,
+            table_options: Dict[str, str] = None
+        ) -> int:
+            """
+            Execute batch updates on a table.
+
+            Args:
+                table_name: Name of the table to update
+                updates: List of update specifications, each containing:
+                         {'set_clause': 'column = value', 'where_clause': 'condition'}
+                batch_size: Number of rows to update per batch
+                table_options: Optional connection parameters
+
+            Returns:
+                Total number of rows updated
+
+            Example:
+                updates = [
+                    {
+                        'set_clause': "field0 = field0 || '_batch1'",
+                        'where_clause': "ycsb_key IN (SELECT ycsb_key FROM usertable ORDER BY ycsb_key LIMIT 500)"
+                    }
+                ]
+                count = connector.batch_update_table('usertable', updates)
+            """
+            conn = self._get_connection(table_options)
+            total_updated = 0
+
+            try:
+                cursor = self._create_cursor(conn)
+                target = f"{self.schema}.{table_name}" if self.schema != 'public' else table_name
+
+                for update_spec in updates:
+                    set_clause = update_spec.get('set_clause', '')
+                    where_clause = update_spec.get('where_clause', '')
+
+                    if not set_clause:
+                        continue
+
+                    sql = f"UPDATE {target} SET {set_clause}"
+                    if where_clause:
+                        sql += f" WHERE {where_clause}"
+
+                    cursor.execute(sql)
+                    conn.commit()
+                    total_updated += 1
+
+                cursor.close()
+                conn.close()
+
+                return total_updated
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                raise
+
+        def cancel_changefeed(
+            self,
+            job_id: int,
+            max_attempts: int = 6,
+            poll_interval: int = 10,
+            table_options: Dict[str, str] = None
+        ) -> Dict[str, Any]:
+            """
+            Cancel a changefeed job and wait for it to complete.
+
+            Args:
+                job_id: The changefeed job ID to cancel
+                max_attempts: Maximum number of status check attempts
+                poll_interval: Seconds to wait between status checks
+                table_options: Optional connection parameters
+
+            Returns:
+                Dictionary with cancellation result:
+                {
+                    'success': bool,
+                    'final_status': str,
+                    'message': str
+                }
+            """
+            import time
+
+            conn = self._get_connection(table_options)
+            try:
+                cursor = self._create_cursor(conn)
+
+                # Issue cancel command
+                cursor.execute(f"CANCEL JOB {job_id}")
+                cursor.close()
+
+                # Poll for completion
+                for attempt in range(max_attempts):
+                    time.sleep(poll_interval)
+
+                    cursor = self._create_cursor(conn)
+                    cursor.execute(f"""
+                        SELECT status
+                        FROM [SHOW JOBS]
+                        WHERE job_id = {job_id}
+                    """)
+
+                    result = cursor.fetchone()
+                    cursor.close()
+
+                    if not result:
+                        conn.close()
+                        return {
+                            'success': False,
+                            'final_status': 'unknown',
+                            'message': 'Job not found after cancel'
+                        }
+
+                    status = result[0]
+
+                    if status in ('canceled', 'cancelled', 'failed'):
+                        conn.close()
+                        return {
+                            'success': True,
+                            'final_status': status,
+                            'message': f'Successfully cancelled (status: {status})'
+                        }
+
+                # Timeout
+                conn.close()
+                return {
+                    'success': False,
+                    'final_status': 'timeout',
+                    'message': f'Cancel timeout after {max_attempts * poll_interval}s'
+                }
+
+            except Exception as e:
+                try:
+                    conn.close()
+                except:
+                    pass
+                return {
+                    'success': False,
+                    'final_status': 'error',
+                    'message': f'Cancel failed: {str(e)}'
+                }
+
+        def _list_azure_parquet_files(
+            self, container_client, prefix: str, last_cursor: str, table_name: str = None
+        ) -> List[Dict[str, Any]]:
+            """
+            List Parquet files in Azure, filtered by cursor and optionally by table name.
+
+            Args:
+                container_client: Azure container client
+                prefix: Path prefix to search
+                last_cursor: Last processed timestamp (cursor)
+                table_name: Optional table name to filter by (embedded in filename)
+
+            Returns: List of file metadata dictionaries with 'name', 'timestamp', 'size'
+            """
+            blobs = container_client.list_blobs(name_starts_with=prefix)
+
+            parquet_files = []
+            for blob in blobs:
+                # Skip non-Parquet files
+                if not blob.name.endswith('.parquet'):
+                    continue
+
+                # Skip .RESOLVED marker files
+                if '.RESOLVED' in blob.name:
+                    continue
+
+                # Filter by table name if provided (table name is embedded in filename)
+                # Example filename: 202512222012135254607470000000000-...-usertable-...
+                if table_name and table_name not in blob.name:
+                    continue
+
+                # Extract timestamp from filename
+                timestamp = self._extract_timestamp_from_blob_name(blob.name)
+                if not timestamp:
+                    continue
+
+                # Filter by cursor
+                if last_cursor and timestamp <= last_cursor:
+                    continue
+
+                parquet_files.append({
+                    'name': blob.name,
+                    'timestamp': timestamp,
+                    'size': blob.size
+                })
+
+            # Sort by timestamp
+            parquet_files.sort(key=lambda f: f['timestamp'])
+
+            return parquet_files
+
+        def _extract_timestamp_from_blob_name(self, blob_name: str) -> str:
+            """
+            Extract CockroachDB timestamp from Parquet file name.
+
+            Example: 202512191714242809831900000000000-...-usertable+fam_0_ycsb_key-4.parquet
+            Returns: "202512191714242809831900000000000"
+            """
+            import re
+            match = re.search(r'(\d{35})', blob_name)
+            return match.group(1) if match else None
+
+        def _ensure_azure_dependencies(self):
+            """
+            Verify Azure dependencies are available.
+
+            Note: Dependencies should be installed via pipeline libraries configuration.
+            This method just imports them - will fail naturally if missing.
+            """
+            if self.mode != "azure_parquet":
+                return
+
+            # Import dependencies - will raise ImportError if not installed
+            import azure.storage.blob
+            import pyarrow.parquet
+            import pandas
+
+
+    # ============================================================================
+    # Utility Functions
+    # ============================================================================
+
+    def load_crdb_config(json_path: str) -> dict:
+        """
+        Load CockroachDB credentials from JSON file.
+
+        Args:
+            json_path: Path to JSON file containing CockroachDB credentials
+
+        Returns:
+            Dictionary with credentials
+
+        Example:
+            config = load_crdb_config('.env/cockroachdb_credentials.json')
+            connector = create_connector(config)
+        """
+        import json
+        with open(json_path) as f:
+            return json.load(f)
+
+
+    def create_connector(
+        crdb_config: dict, 
+        catalog: str = 'defaultdb', 
+        schema: str = 'public',
+        azure_config: dict = None
+    ) -> LakeflowConnect:
+        """
+        Create LakeflowConnect instance from configuration dictionary.
+
+        Supports multiple formats:
+        - token + base_url (GitHub-style)
+        - cockroachdb_url (full PostgreSQL URL)
+        - host + port + database + user + password (individual params)
+
+        Optionally adds Azure credentials for changefeed mode.
+
+        Args:
+            crdb_config: Dictionary with CockroachDB credentials
+            catalog: Database/catalog name (default: 'defaultdb')
+            schema: Schema name (default: 'public')
+            azure_config: Optional dictionary with Azure credentials:
+                         {'azure_account_name', 'azure_account_key', 'azure_container'}
+
+        Returns:
+            Configured LakeflowConnect instance
+
+        Example:
+            crdb_config = load_crdb_config('.env/cockroachdb_credentials.json')
+            azure_config = load_crdb_config('.env/cockroachdb_cdc_azure.json')
+            connector = create_connector(crdb_config, azure_config=azure_config)
+        """
+        import io
+        import contextlib
+
+        options = {
+            'catalog': catalog,
+            'schema': schema
+        }
+
+        # Support multiple credential formats
+        if 'token' in crdb_config and 'base_url' in crdb_config:
+            # GitHub-style format
+            options['token'] = crdb_config['token']
+            options['base_url'] = crdb_config['base_url']
+        elif 'cockroachdb_url' in crdb_config:
+            # Full URL format - convert to token+base_url
+            url = crdb_config['cockroachdb_url']
+
+            if not url.startswith('postgresql://'):
+                raise ValueError("cockroachdb_url must start with 'postgresql://'")
+
+            if '@' not in url:
+                raise ValueError("cockroachdb_url must contain credentials (user:pass@host)")
+
+            # Extract token (user:pass) and base_url (host:port/db?params)
+            url_without_scheme = url.replace('postgresql://', '', 1)
+            token_part, host_part = url_without_scheme.split('@', 1)
+
+            options['token'] = token_part
+            options['base_url'] = f"postgresql://{host_part}"
+        elif 'host' in crdb_config:
+            # Individual parameters format
+            options['host'] = crdb_config['host']
+            options['port'] = crdb_config.get('port', 26257)
+            options['database'] = crdb_config['database']
+            options['user'] = crdb_config['user']
+            options['password'] = crdb_config.get('password', '')
+            options['sslmode'] = crdb_config.get('sslmode', 'require')
+        else:
+            raise ValueError(
+                "Config must contain either 'token'+'base_url', 'cockroachdb_url', "
+                "or 'host'+'database'+'user'"
+            )
+
+        # Add Azure credentials if provided
+        if azure_config:
+            options['azure_account_name'] = azure_config.get('azure_storage_account')
+            options['azure_account_key'] = azure_config.get('azure_storage_key')
+            options['azure_container'] = azure_config.get('azure_storage_container')
+
+        # Suppress print statement from __init__
+        with contextlib.redirect_stdout(io.StringIO()):
+            connector = LakeflowConnect(options)
+
+        return connector
+
+
+    def analyze_json_changefeed_file(blob_service_client, container_name: str, blob_name: str) -> dict:
+        """
+        Analyze a JSON/NDJSON changefeed file from Azure Blob Storage.
+
+        Args:
+            blob_service_client: Azure BlobServiceClient instance
+            container_name: Azure container name
+            blob_name: Blob name (path to JSON file)
+
+        Returns:
+            Dictionary with statistics: {'snapshot': int, 'insert': int, 'update': int, 'delete': int}
+        """
+        import json
+
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+        # Download blob content
+        download_stream = blob_client.download_blob()
+        content = download_stream.readall().decode('utf-8')
+
+        stats = {'snapshot': 0, 'insert': 0, 'update': 0, 'delete': 0}
+
+        for line in content.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+
+                # Check if this is a snapshot event (no 'before' field in wrapped format)
+                after = event.get('after')
+                before = event.get('before')
+
+                if after and not before:
+                    # This could be INSERT or snapshot
+                    stats['snapshot'] += 1
+                elif after and before:
+                    # UPDATE
+                    stats['update'] += 1
+                elif before and not after:
+                    # DELETE
+                    stats['delete'] += 1
+
+            except json.JSONDecodeError:
+                continue
+
+        return stats
+
+
+    def analyze_parquet_changefeed_file(
+        blob_service_client, 
+        container_name: str, 
+        blob_name: str,
+        debug: bool = False
+    ) -> dict:
+        """
+        Analyze a Parquet changefeed file from Azure Blob Storage.
+
+        Args:
+            blob_service_client: Azure BlobServiceClient instance
+            container_name: Azure container name
+            blob_name: Blob name (path to Parquet file)
+            debug: Enable debug output
+
+        Returns:
+            Dictionary with statistics: {'snapshot': int, 'insert': int, 'update': int, 'delete': int}
+        """
+        try:
+            import pandas as pd
+            import pyarrow.parquet as pq
+            from io import BytesIO
+        except ImportError:
+            raise ImportError("pyarrow and pandas required for Parquet analysis. Install: pip install pyarrow pandas")
+
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+        # Download blob to memory
+        download_stream = blob_client.download_blob()
+        parquet_data = BytesIO(download_stream.readall())
+
+        # Read parquet
+        df = pd.read_parquet(parquet_data)
+
+        if debug and len(df) > 0:
+            print(f"\n🔍 DEBUG: Parquet schema for {blob_name.split('/')[-1][:40]}...")
+            print(f"   Columns: {list(df.columns)}")
+            print(f"   Row count: {len(df)}")
+            print(f"   First row sample:")
+            print(f"   {df.iloc[0].to_dict()}")
+
+        stats = {'snapshot': 0, 'insert': 0, 'update': 0, 'delete': 0}
+
+        # CockroachDB Parquet changefeeds with split_column_families
+        # Format 1: CockroachDB-specific with __crdb__event_type column
+        if '__crdb__event_type' in df.columns:
+            # CockroachDB native Parquet format
+            for _, row in df.iterrows():
+                event_type = row.get('__crdb__event_type', '')
+
+                if event_type == 'c':
+                    # 'c' = snapshot/change (CANNOT distinguish between snapshot and update in Parquet)
+                    stats['snapshot'] += 1
+                elif event_type == 'i':
+                    # 'i' = insert (new CDC row)
+                    stats['insert'] += 1
+                elif event_type == 'u':
+                    # 'u' = update (kept for compatibility, but does NOT exist in Parquet format)
+                    stats['update'] += 1
+                elif event_type == 'd':
+                    # 'd' = delete
+                    stats['delete'] += 1
+
+        # Format 2: Debezium-style with 'after' and 'before' columns
+        elif 'after' in df.columns and 'before' in df.columns:
+            for _, row in df.iterrows():
+                after = row.get('after')
+                before = row.get('before')
+
+                # Check if after/before are None or have data
+                has_after = after is not None and (not isinstance(after, dict) or len(after) > 0)
+                has_before = before is not None and (not isinstance(before, dict) or len(before) > 0)
+
+                if has_after and not has_before:
+                    stats['snapshot'] += 1
+                elif has_after and has_before:
+                    stats['update'] += 1
+                elif has_before and not has_after:
+                    stats['delete'] += 1
+
+        # Format 3: Nested value format
+        elif 'value' in df.columns:
+            for _, row in df.iterrows():
+                value = row.get('value', {})
+                if isinstance(value, dict):
+                    after = value.get('after')
+                    before = value.get('before')
+                else:
+                    continue
+
+                if after and not before:
+                    stats['snapshot'] += 1
+                elif after and before:
+                    stats['update'] += 1
+                elif before and not after:
+                    stats['delete'] += 1
+
+        # Unrecognized format
+        else:
+            if debug:
+                print(f"   ⚠️  Unrecognized Parquet format - no '__crdb__event_type', 'after'/'before', or 'value' columns")
+
+        return stats
+
+
+    def analyze_azure_changefeed_files(
+        account_name: str,
+        account_key: str,
+        container_name: str,
+        path_prefix: str,
+        format_type: str = 'parquet',
+        debug: bool = False
+    ) -> dict:
+        """
+        Analyze all changefeed files in Azure Blob Storage and return statistics.
+
+        For Parquet format with split_column_families, automatically deduplicates
+        events by primary key using the same coalescing logic as the connector.
+
+        Args:
+            account_name: Azure storage account name
+            account_key: Azure storage account key
+            container_name: Azure container name
+            path_prefix: Path prefix to search (e.g., 'parquet-cdc' or 'json-cdc')
+            format_type: 'parquet' or 'json'
+            debug: Enable debug output
+
+        Returns:
+            Dictionary with aggregated statistics:
+            {
+                'snapshot': int,
+                'insert': int,
+                'update': int,
+                'delete': int,
+                'file_count': int,
+                'unique_keys': int  # Only for Parquet with deduplication
+            }
+
+        Example:
+            azure_config = load_crdb_config('.env/cockroachdb_cdc_azure.json')
+            stats = analyze_azure_changefeed_files(
+                azure_config['azure_storage_account'],
+                azure_config['azure_storage_key'],
+                azure_config['azure_storage_container'],
+                'parquet-cdc',
+                format_type='parquet'
+            )
+            print(f"Snapshot: {stats['snapshot']}, Updates: {stats['update']}")
+        """
+        from azure.storage.blob import BlobServiceClient
+
+        # Connect to Azure
+        connection_string = (
+            f"DefaultEndpointsProtocol=https;"
+            f"AccountName={account_name};"
+            f"AccountKey={account_key};"
+            f"EndpointSuffix=core.windows.net"
+        )
+
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
+
+        # Determine file extension and analysis function
+        if format_type == 'parquet':
+            file_extension = '.parquet'
+        else:
+            file_extension = '.ndjson'
+
+        # Collect all data files (exclude .RESOLVED files)
+        data_blobs = []
+        blob_list = container_client.list_blobs(name_starts_with=path_prefix)
+        for blob in blob_list:
+            if file_extension in blob.name and not blob.name.endswith('.RESOLVED'):
+                data_blobs.append(blob.name)
+
+        if not data_blobs:
+            return {
+                'snapshot': 0,
+                'insert': 0,
+                'update': 0,
+                'delete': 0,
+                'file_count': 0
+            }
+
+        # For Parquet format with split_column_families, use coalescing logic
+        if format_type == 'parquet':
+            import pandas as pd
+            from io import BytesIO
+
+            all_events = []
+
+            for blob_name in data_blobs:
+                try:
+                    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+                    download_stream = blob_client.download_blob()
+                    parquet_data = BytesIO(download_stream.readall())
+                    df = pd.read_parquet(parquet_data)
+
+                    # Process rows using LakeflowConnect's method
+                    connector = LakeflowConnect({})
+                    records = df.to_dict('records')
+                    transformed = connector._process_parquet_records(records, blob_name, None)
+                    all_events.extend(transformed)
+
+                except Exception as e:
+                    if debug:
+                        print(f"Error processing {blob_name}: {e}")
+                    continue
+
+            # Deduplicate using coalescing logic
+            connector = LakeflowConnect({})
+            coalesced_events = connector._coalesce_events_by_key(all_events)
+
+            # Count operations from coalesced events
+            total_stats = {'snapshot': 0, 'insert': 0, 'update': 0, 'delete': 0}
+            for event in coalesced_events:
+                operation = event.get('_cdc_operation', 'UNKNOWN')
+                if operation == 'SNAPSHOT':
+                    total_stats['snapshot'] += 1
+                elif operation == 'INSERT':
+                    total_stats['insert'] += 1
+                elif operation == 'UPDATE':
+                    total_stats['update'] += 1
+                elif operation == 'DELETE':
+                    total_stats['delete'] += 1
+
+            total_stats['file_count'] = len(data_blobs)
+            total_stats['unique_keys'] = len(coalesced_events)
+            return total_stats
+
+        else:
+            # For JSON, just sum up individual file stats
+            total_stats = {'snapshot': 0, 'insert': 0, 'update': 0, 'delete': 0}
+
+            for blob_name in data_blobs:
+                try:
+                    file_stats = analyze_json_changefeed_file(blob_service_client, container_name, blob_name)
+                    total_stats['snapshot'] += file_stats['snapshot']
+                    total_stats['insert'] += file_stats['insert']
+                    total_stats['update'] += file_stats['update']
+                    total_stats['delete'] += file_stats['delete']
+                except Exception as e:
+                    if debug:
+                        print(f"Error processing {blob_name}: {e}")
+                    continue
+
+            total_stats['file_count'] = len(data_blobs)
+            return total_stats
 
 
     ########################################################

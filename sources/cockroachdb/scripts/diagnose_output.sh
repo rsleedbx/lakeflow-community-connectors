@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Diagnostic script to understand why only 11 rows are being output
 
 set -e
@@ -49,4 +49,7 @@ echo "  - 'Total events returned:'"
 echo ""
 echo "This will confirm if the ingestion_type='snapshot' fix was applied."
 echo "=========================================="
+
+
+
 

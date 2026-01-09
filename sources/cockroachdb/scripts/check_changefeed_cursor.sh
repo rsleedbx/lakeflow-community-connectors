@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Check if there should be changes since a given cursor
 # Usage: ./check_changefeed_cursor.sh <cursor_timestamp>
 
@@ -115,4 +115,7 @@ echo ""
 echo "  # Generate test changes:"
 echo "  cockroach workload run ycsb \$COCKROACHDB_URL --duration 30s"
 echo ""
+
+
+
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Debug script to diagnose connection issues
 # Run this in your terminal: ./debug_connection.sh
 

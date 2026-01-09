@@ -285,3 +285,10 @@ databricks pipelines get <pipeline_id> | jq '.latest_updates[0]'
 
 **Result:** Idle CDC runs now complete in ~5 seconds instead of ~30 seconds! 🚀
 
+
+
+
+
+
+
+

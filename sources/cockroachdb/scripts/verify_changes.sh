@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify changes exist since cursor
 
 set -e
@@ -68,4 +68,7 @@ echo ""
 echo "========================================="
 echo "✅ Verification Complete"
 echo "========================================="
+
+
+
 

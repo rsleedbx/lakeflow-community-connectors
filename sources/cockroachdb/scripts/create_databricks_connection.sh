@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 # Usage: ./create_databricks_connection.sh <connection_url> [connection_name]

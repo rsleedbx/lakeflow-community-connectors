@@ -163,7 +163,7 @@ When using `sslrootcert='system'`:
 ## 🔗 **Related Issues**
 
 - **Spark Serialization**: [SPARK_SERIALIZATION_FIX.md](SPARK_SERIALIZATION_FIX.md) - Lazy connection initialization
-- **Connection Parameters**: [HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md) - How credentials are passed
+- **Unity Catalog Connections**: [HARDCODED_CONNECTION_BUG.md](HARDCODED_CONNECTION_BUG.md) - channel=preview required for UC connections
 
 ---
 
@@ -215,8 +215,7 @@ conn = psycopg2.connect(**connection_params)  # Use kwargs, not DSN
 
 **Issues Fixed**:
 - ✅ Spark serialization (lazy connection initialization)
-- ✅ Hardcoded connection name bug
-- ✅ Unity Catalog credential passing
+- ✅ Unity Catalog credential passing (channel=preview required for community connectors)
 - ✅ Database override restriction
 - ✅ Schema override restriction
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 echo "🚀 DEPLOYING COCKROACHDB CONNECTOR WITH EVENT COALESCING"
@@ -99,4 +99,7 @@ echo "📝 Verify Success:"
 echo "  SELECT COUNT(*) FROM main.robert_lee_cockroachdb.usertable;"
 echo "  -- Expected: ~10,000 rows"
 echo ""
+
+
+
 

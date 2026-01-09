@@ -306,3 +306,10 @@ table_config = {
 
 **Result:** Multi-table CDC pipelines now have consistent point-in-time snapshots! 🎯
 
+
+
+
+
+
+
+

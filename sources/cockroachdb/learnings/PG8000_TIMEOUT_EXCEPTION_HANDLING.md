@@ -273,3 +273,10 @@ The fix ensures that `pg8000` statement timeout exceptions are:
 
 **Result:** Idle CDC runs exit cleanly in ~5 seconds, and large snapshot timeouts save progress correctly! 🎯
 
+
+
+
+
+
+
+

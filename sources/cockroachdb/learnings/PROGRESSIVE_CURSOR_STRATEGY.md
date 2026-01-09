@@ -229,3 +229,10 @@ End offset: {"cursor": "1766105723451080606.0000000000"}
 
 **Result:** Robust, production-ready CDC for datasets of ANY size! 🚀
 
+
+
+
+
+
+
+

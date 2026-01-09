@@ -265,3 +265,10 @@ The connector currently uses:
 
 This provides reliable timeout control at both the connection and query levels.
 
+
+
+
+
+
+
+
