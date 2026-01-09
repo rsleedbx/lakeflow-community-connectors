@@ -5864,6 +5864,7 @@ def load_and_merge_cdc_to_delta(
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
     
     from delta.tables import DeltaTable
+    from pyspark.sql import Window
     
     # Step 1: Write all raw CDC events to temp table using append mode
     # We write BEFORE column family merge to avoid aggregations in streaming
@@ -5972,20 +5973,35 @@ def load_and_merge_cdc_to_delta(
         active_rows = df_all_events.filter(F.col("_cdc_operation") != "DELETE")
         
         # Exclude rows with keys that are deleted
-        final_rows = active_rows.join(
+        rows_after_delete = active_rows.join(
             delete_keys,
             on=primary_keys,
             how="left_anti"
         )
         
+        # CRITICAL: For initial table creation, keep only LATEST state per key
+        # We may have multiple events for same key (SNAPSHOT + UPDATE), but
+        # the final table should only have one row per key (the latest state)
+        
+        # Add row number partitioned by PK, ordered by timestamp DESC
+        window_spec = Window.partitionBy(*primary_keys).orderBy(F.col("_cdc_timestamp").desc())
+        final_rows = (rows_after_delete
+            .withColumn("_row_num", F.row_number().over(window_spec))
+            .filter(F.col("_row_num") == 1)
+            .drop("_row_num")
+        )
+        
         if debug:
             delete_count = delete_keys.count()
             active_count = active_rows.count()
+            after_delete_count = rows_after_delete.count()
             final_count = final_rows.count()
             print(f"   🔍 Keys to delete: {delete_count}")
             print(f"   🔍 Non-DELETE rows: {active_count}")
-            print(f"   🔍 After excluding DELETEd keys: {final_count}")
-            print(f"   🔍 Rows removed: {active_count - final_count}")
+            print(f"   🔍 After excluding DELETEd keys: {after_delete_count}")
+            print(f"   🔍 After deduplication (latest per key): {final_count}")
+            print(f"   🔍 Rows removed by DELETE: {active_count - after_delete_count}")
+            print(f"   🔍 Duplicate events removed: {after_delete_count - final_count}")
             print(f"   📝 Creating initial table: {final_count:,} rows")
         
         final_rows.write \
