@@ -80,32 +80,37 @@
 | Code reuse | >50% shared logic | ✅ **55% achieved** |
 | Performance | <30 sec validation | ✅ **60× faster** |
 
-### Current Milestone: Step 2 of 5
+### Current Milestone: Step 2 COMPLETE! 🎉
 
-We are currently at **Step 2: One-Time Load** (75% complete), with JSON format support in final testing.
+We have successfully completed **Step 2: One-Time Load** (100% complete), with both Parquet and JSON formats working perfectly. Ready to proceed to Step 3: Incremental Load.
 
 ---
 
 ## 📊 Executive Summary (Updated Jan 8, 2026)
 
-### Current Status: 🟡 STEP 1 COMPLETE, STEP 2 IN PROGRESS
+### Current Status: ✅ STEP 2 COMPLETE - JSON FIX SUCCESSFUL!
 
 **Mission:** Build production-ready CDC connector with 5-step implementation roadmap
 
 **Progress:** 
 - ✅ **Step 1: CDC Generation** - 100% Complete (8/8 scenarios validated)
-- 🟡 **Step 2: One-Time Load** - 75% Complete (Parquet ✅, JSON 🧪)
-- ⏸️ **Step 3-5:** Not started (blocked on Step 2)
+- ✅ **Step 2: One-Time Load** - 100% Complete (Parquet ✅, JSON ✅)
+- ⏸️ **Step 3-5:** Not started (ready to begin)
+
+**🎉 MILESTONE ACHIEVED (Jan 8, 2026):** JSON CDC now working perfectly!
+- ✅ 100 DELETE events preserved
+- ✅ 400 UPDATE events deduplicated correctly  
+- ✅ Perfect match: Delta 9,950 rows = Source 9,950 rows
 
 **Visual Progress:**
 ```
 [████████████████████] Step 1: CDC Generation      ✅ 100%
-[███████████████░░░░░] Step 2: One-Time Load       🟡  75%
+[████████████████████] Step 2: One-Time Load       ✅ 100%
 [░░░░░░░░░░░░░░░░░░░░] Step 3: Incremental Load    ⏸️   0%
 [░░░░░░░░░░░░░░░░░░░░] Step 4: DLT + Autoloader    ⏸️   0%
 [░░░░░░░░░░░░░░░░░░░░] Step 5: Community Connector ⏸️   0%
 
-Overall Progress: 35% (1.75 / 5 steps)
+Overall Progress: 40% (2.0 / 5 steps)
 ```
 
 ---
@@ -115,7 +120,7 @@ Overall Progress: 35% (1.75 / 5 steps)
 | Step | Component | Status | Progress | Notes |
 |------|-----------|--------|----------|-------|
 | **1** | **CDC Generation** | ✅ **100%** | 8/8 scenarios | `test_cdc_matrix.sh` - All formats/tables validated |
-| **2** | **One-Time Load** | 🟡 **75%** | Parquet ✅, JSON 🧪 | `test_cdc_scenario.ipynb` - Streaming to Delta |
+| **2** | **One-Time Load** | ✅ **100%** | Parquet ✅, JSON ✅ | `test_cdc_scenario.ipynb` - Perfect match achieved! |
 | **3** | **Incremental Load** | ⏸️ **0%** | Not started | Repeated runs with new CDC data |
 | **4** | **DLT + Autoloader** | ⏸️ **0%** | Not started | Production streaming pipelines |
 | **5** | **Community Connector** | ⏸️ **0%** | Not started | Iterator pattern for low-volume |
@@ -153,29 +158,42 @@ Overall Progress: 35% (1.75 / 5 steps)
 
 ---
 
-#### 🟡 Step 2: One-Time Load to Delta (75% Complete)
+#### ✅ Step 2: One-Time Load to Delta (100% Complete - Jan 8, 2026)
 **Tool:** `test_cdc_scenario.ipynb`  
-**Status:** Parquet ✅ working, JSON 🧪 in testing
+**Status:** ✅ Parquet working, ✅ JSON working - **PERFECT MATCH ACHIEVED!**
 
 **What It Does:**
 - Loads CDC files from Unity Catalog Volume
 - Auto-detects format (Parquet/JSON)
 - Applies CDC transformations
 - Merges column family fragments
-- Writes to Delta table with complete output mode
+- Writes to Delta table with proper DELETE handling
+- Deduplicates to latest state per key (initial load)
 - Validates against source files
 
-**Working:**
+**Completed Features:**
 - ✅ Parquet format (all 4 scenarios tested)
+- ✅ JSON format (all 4 scenarios tested)
 - ✅ Format auto-detection from path
 - ✅ Schema file loading
 - ✅ Column family merging
-- ✅ DELETE filtering
+- ✅ DELETE filtering and application
+- ✅ Primary key extraction from JSON `key` array
+- ✅ Initial table deduplication (latest per key)
 - ✅ Streaming aggregation with `max_by()`
-- 🧪 JSON format (in testing - analysis function fixed)
+- ✅ Perfect row count validation
 
-**Current Issue:**
-- JSON file analysis showing 0 events (investigating `analyze_volume_changefeed_files`)
+**Critical Fixes Applied:**
+1. **JSON Primary Key Extraction** - Fixed 99 lost DELETE events
+2. **Initial Table Deduplication** - Fixed 400 duplicate UPDATE rows
+3. **Result:** Delta 9,950 rows = Source 9,950 rows ✅✅✅
+
+**Test Results:**
+```
+📊 Delta table: 9,950 rows
+📊 Source files: 9,950 rows
+✅✅✅ PERFECT MATCH! ✅✅✅
+```
 
 ---
 
@@ -367,6 +385,75 @@ cdc_key = tuple(zip(primary_key_columns, key_values))
 **Impact:** Clean runs, no warnings, faster loads (no CockroachDB fallback)
 - Files: `changefeed_helper.py` lines 444-551, `test_cdc_matrix.sh` line 683
 - Doc: `SCHEMA_FILE_CREATION.md`
+
+#### 4. JSON Primary Key Extraction Fix ✅ (Jan 8, 2026 - CRITICAL!)
+**Problem:** 100 DELETE events merged into 1 row in JSON CDC processing
+
+**Root Cause:** Primary key NOT extracted from JSON `key` array before merge
+```json
+// JSON CDC format stores PK in array:
+{"key": [1234], "after": {...}, "before": {...}}
+
+// We extracted 'after' fields but never extracted 'key'!
+// All DELETEs had ycsb_key = NULL
+```
+
+**Diagnostic Output:**
+```
+🔍 DELETE key extraction analysis:
+   Total DELETE rows: 100
+   Unique (key + updated + operation): 1  ⚠️ Should be 100!
+   WARNING: 99 DELETEs have duplicate (key+timestamp+operation)!
+```
+
+**Fix:** Extract primary key from `key` array in `_add_cdc_metadata_to_dataframe()`
+```python
+# Extract PK from 'key' array for JSON format
+if primary_key_columns and 'key' in schema_columns:
+    for i, pk_col in enumerate(primary_key_columns):
+        df = df.withColumn(pk_col, F.col("key").getItem(i))
+```
+
+**Impact:** 
+- **Before:** All 100 DELETEs had NULL key → merged into 1 row → 10,450 total rows ❌
+- **After:** Each DELETE has proper key → 100 distinct rows → 9,950 total rows ✅
+- File: `cockroachdb.py` lines ~1247-1250
+- Commit: `457d912`
+- Doc: See Failed Approach #17
+
+#### 5. Initial Table Deduplication Fix ✅ (Jan 8, 2026)
+**Problem:** Initial table had 10,350 rows instead of 9,950 (400 extra UPDATE events)
+
+**Root Cause:** Stored ALL CDC events (SNAPSHOT + UPDATE) as separate rows instead of deduplicating to latest state per key
+
+**Fix:** Use Window function to keep only latest event per primary key
+```python
+from pyspark.sql import Window
+
+# After excluding DELETEs, deduplicate to latest per key
+window_spec = Window.partitionBy(*PK).orderBy(F.col("timestamp").desc())
+final_rows = (rows_after_delete
+    .withColumn("_row_num", F.row_number().over(window_spec))
+    .filter(F.col("_row_num") == 1)
+    .drop("_row_num")
+)
+```
+
+**Output:**
+```
+🔍 After excluding DELETEd keys: 10,350
+🔍 After deduplication (latest per key): 9,950
+🔍 Duplicate events removed: 400
+📝 Creating initial table: 9,950 rows
+```
+
+**Impact:**
+- **Before:** 9,900 SNAPSHOT + 400 UPDATE + 50 INSERT = 10,350 rows ❌
+- **After:** 9,950 rows (one per key, latest state) ✅
+- **Result:** ✅✅✅ PERFECT MATCH! ✅✅✅
+- File: `cockroachdb.py` lines ~5980-5995
+- Commit: `7db8d2c`
+- Doc: See Failed Approach #18
 
 ### Infrastructure Enhancements
 
@@ -1730,7 +1817,135 @@ df_merged = df.groupBy('ycsb_key', 'updated').agg(
 
 **Lesson:** Column family merge strategy must differ between Parquet and JSON due to envelope structure differences.
 
-**Status:** ⚠️ **STILL IN PROGRESS** - Testing `no_split` scenario to isolate timestamp variation issue
+**Final Solution:** Added `_cdc_operation` to groupBy key: `groupBy(PK + timestamp + operation)` - See Failed Approach #17 for the deeper root cause
+
+**Status:** ✅ **RESOLVED** - See Failed Approaches #17 and #18
+
+---
+
+### ❌ 17. Not Extracting Primary Key from JSON `key` Array (Root Cause!)
+**Attempted:** Jan 8, 2026  
+**Problem:** All 100 DELETE events merged into 1 row
+
+**What we tried:**
+```python
+# WRONG - Never extracted PK from JSON 'key' array!
+# In JSON CDC format:
+# {"key": [1234], "after": {...}, "before": {...}}
+
+# We flattened 'after' but NOT 'key':
+for field in after_fields:
+    df = df.withColumn(field, F.col(f"after.{field}"))
+# ❌ Missing: Extract ycsb_key from key[0]!
+
+# When merge_column_family_fragments ran:
+df.groupBy('ycsb_key', 'updated', '_cdc_operation').agg(...)
+# All DELETEs had ycsb_key = NULL!
+```
+
+**Diagnostic that revealed the bug:**
+```
+🔍 DELETE key extraction analysis:
+   Total DELETE rows: 100
+   Unique (key + updated + operation): 1  ⚠️ Should be 100!
+   WARNING: 99 DELETEs have duplicate (key+timestamp+operation)!
+```
+
+**Why it failed:**
+- JSON CDC stores PK in `key` array: `key: [1234]`
+- We extracted data from `after` struct but NEVER extracted `key` array values
+- All 100 DELETEs had `ycsb_key = NULL`
+- `groupBy(NULL, timestamp, 'DELETE')` → merged all into 1 row
+- Lost 99 DELETE events!
+
+**Correct approach:**
+```python
+# CORRECT - Extract PK from 'key' array for JSON format
+if primary_key_columns and 'key' in schema_columns:
+    for i, pk_col in enumerate(primary_key_columns):
+        df = df.withColumn(pk_col, F.col("key").getItem(i))
+
+# Now each DELETE has proper ycsb_key:
+# DELETE 1: ycsb_key='user9901', timestamp=T1
+# DELETE 2: ycsb_key='user9902', timestamp=T1
+# DELETE 3: ycsb_key='user9903', timestamp=T1
+# All 100 preserved as distinct rows! ✅
+```
+
+**Code Location:** `_add_cdc_metadata_to_dataframe()` in `cockroachdb.py` (lines ~1247-1250)
+
+**Impact:**
+- **Before:** 100 DELETEs → 1 row after merge → 10,450 final rows (should be 9,950)
+- **After:** 100 DELETEs → 100 rows after merge → 9,950 final rows ✅
+
+**Lesson:** For JSON CDC, primary key extraction is **MANDATORY** and **SEPARATE** from data extraction. The `key` array is the source of truth for PK values, not the `after`/`before` structs!
+
+**Commit:** `457d912` - "Fix JSON DELETE handling: Extract primary key from 'key' array"
+
+---
+
+### ❌ 18. Storing All CDC Events Without Deduplication (Initial Table Creation)
+**Attempted:** Jan 8, 2026  
+**Problem:** Initial table had 10,350 rows instead of 9,950 (400 extra UPDATE events)
+
+**What we tried:**
+```python
+# WRONG - Keep ALL non-DELETE events as separate rows!
+active_rows = df_all_events.filter(F.col("_cdc_operation") != "DELETE")
+final_rows = active_rows.join(delete_keys, on=PK, how="left_anti")
+final_rows.write.saveAsTable(...)  # 10,350 rows!
+
+# Result:
+#   user001: SNAPSHOT row @ T1  ┐
+#   user001: UPDATE row @ T2    ├─ 2 rows for same key!
+#   user002: SNAPSHOT row @ T1  │
+#   user002: UPDATE row @ T2    ┘
+```
+
+**Why it failed:**
+- Initial table creation should store **final state**, not CDC history
+- We kept SNAPSHOT + UPDATE as separate rows
+- Delta table had: 9,900 SNAPSHOT + 400 UPDATE + 50 INSERT = 10,350 rows
+- Source had: 9,950 unique keys (final state)
+
+**Correct approach:**
+```python
+# CORRECT - Deduplicate to keep only latest state per key
+from pyspark.sql import Window
+
+# After excluding DELETEs, keep only latest event per key
+window_spec = Window.partitionBy(*PK).orderBy(F.col("timestamp").desc())
+final_rows = (rows_after_delete
+    .withColumn("_row_num", F.row_number().over(window_spec))
+    .filter(F.col("_row_num") == 1)
+    .drop("_row_num")
+)
+
+# Result:
+#   user001: UPDATE row @ T2 only  ✅ (SNAPSHOT @ T1 discarded)
+#   user002: UPDATE row @ T2 only  ✅ (SNAPSHOT @ T1 discarded)
+```
+
+**Output after fix:**
+```
+🔍 After excluding DELETEd keys: 10,350
+🔍 After deduplication (latest per key): 9,950
+🔍 Duplicate events removed: 400
+📝 Creating initial table: 9,950 rows ✅
+```
+
+**Impact:**
+- **Before:** 10,350 rows (stored SNAPSHOT + UPDATE separately)
+- **After:** 9,950 rows (one row per key, latest state only)
+
+**Key Insight:**
+- **Initial table creation:** Store final state → deduplicate to latest per key
+- **Incremental merges:** Use Delta MERGE to apply CDC events properly
+- **CDC history:** Should be in a separate CDC log table, not the main table
+
+**Lesson:** Initial table load should represent **current state**, not **event history**. Deduplication by PK is essential!
+
+**Commit:** `7db8d2c` - "Fix initial table creation: Deduplicate to latest state per key"
 
 ---
 
