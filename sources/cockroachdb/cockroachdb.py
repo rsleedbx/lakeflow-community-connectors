@@ -5910,16 +5910,31 @@ def load_and_merge_cdc_to_delta(
             
             # DIAGNOSTIC: Check if DELETE timestamps are unique
             timestamp_cols = [c for c in ['updated', '_cdc_timestamp', '__crdb__updated'] if c in all_cols]
-            if timestamp_cols and 'ycsb_key' in all_cols:
+            if timestamp_cols and primary_keys:
                 ts_col = timestamp_cols[0]
-                deletes_df = df_raw_events.filter(F.col("_cdc_operation") == "DELETE")
-                unique_delete_combos = deletes_df.select('ycsb_key', ts_col, '_cdc_operation').distinct().count()
-                total_deletes = deletes_df.count()
-                print(f"   🔍 DELETE timestamp analysis:")
-                print(f"      Total DELETE rows: {total_deletes}")
-                print(f"      Unique (key + {ts_col} + operation): {unique_delete_combos}")
-                if total_deletes != unique_delete_combos:
-                    print(f"      ⚠️  WARNING: {total_deletes - unique_delete_combos} DELETEs have duplicate (key+timestamp+operation)!")
+                # Check if primary key columns exist in the DataFrame
+                pk_cols_exist = all(pk in all_cols for pk in primary_keys)
+                if pk_cols_exist:
+                    deletes_df = df_raw_events.filter(F.col("_cdc_operation") == "DELETE")
+                    total_deletes = deletes_df.count()
+                    if total_deletes > 0:
+                        unique_delete_combos = deletes_df.select(primary_keys + [ts_col, '_cdc_operation']).distinct().count()
+                        print(f"   🔍 DELETE key extraction analysis:")
+                        print(f"      Total DELETE rows: {total_deletes}")
+                        print(f"      Unique (key + {ts_col} + operation): {unique_delete_combos}")
+                        
+                        # Show sample ycsb_key values
+                        sample_keys = deletes_df.select(primary_keys[0]).limit(5).collect()
+                        sample_key_values = [row[primary_keys[0]] for row in sample_keys]
+                        print(f"      Sample {primary_keys[0]} values: {sample_key_values[:5]}")
+                        
+                        if total_deletes != unique_delete_combos:
+                            print(f"      ⚠️  WARNING: {total_deletes - unique_delete_combos} DELETEs have duplicate (key+timestamp+operation)!")
+                        else:
+                            print(f"      ✅ All DELETEs have unique (key+timestamp+operation)")
+                else:
+                    print(f"   ⚠️  Primary key columns {primary_keys} not found in DataFrame!")
+                    print(f"      Available columns: {all_cols[:20]}...")
         else:
             print(f"      ⚠️  No _cdc_operation column found!")
     
