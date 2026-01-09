@@ -26,6 +26,7 @@ WORKLOAD_DELETE_COUNT=100
 # Parse command line arguments
 FILTER_FORMAT=""
 VALIDATE_ONLY=false
+INCREMENTAL_MODE=false
 TEST_RUN_TIMESTAMP=$(date +%s)
 
 while [ $# -gt 0 ]; do
@@ -44,6 +45,19 @@ while [ $# -gt 0 ]; do
             fi
             shift
             ;;
+        --incremental|-i)
+            INCREMENTAL_MODE=true
+            # Check if next arg is a timestamp
+            if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                TEST_RUN_TIMESTAMP="$2"
+                shift
+            else
+                # Find latest timestamp from Azure
+                echo "🔍 Finding latest test run timestamp for incremental load..."
+                TEST_RUN_TIMESTAMP="latest"
+            fi
+            shift
+            ;;
         json|parquet)
             FILTER_FORMAT="$1"
             shift
@@ -57,14 +71,25 @@ while [ $# -gt 0 ]; do
             echo "    $0 json             # Test only JSON format"
             echo "    $0 parquet          # Test only Parquet format"
             echo ""
+            echo "  Incremental Mode:"
+            echo "    $0 --incremental                # Run incremental workload on latest test"
+            echo "    $0 --incremental 1767895046     # Run incremental on specific timestamp"
+            echo "    $0 -i json                      # Run incremental on latest JSON tests only"
+            echo ""
             echo "  Validation Mode:"
             echo "    $0 --validate-only              # Validate latest test run"
             echo "    $0 --validate-only 1767895046   # Validate specific timestamp"
             echo "    $0 -v json                      # Validate latest JSON tests only"
             echo ""
             echo "Options:"
+            echo "  -i, --incremental    Run incremental workload on existing data (tests Step 3)"
             echo "  -v, --validate-only  Skip changefeed creation, analyze existing files"
             echo "  -h, --help           Show this help message"
+            echo ""
+            echo "Incremental mode tests CDC incremental processing by:"
+            echo "  • Running a new workload on existing tables"
+            echo "  • Waiting for CDC files to flush"
+            echo "  • Processing only new CDC events (via Autoloader checkpoints)"
             echo ""
             echo "Validation mode is much faster and useful for:"
             echo "  • Testing code changes against existing data"
@@ -86,6 +111,15 @@ if $VALIDATE_ONLY; then
     if [ -n "$FILTER_FORMAT" ]; then
         echo "   Format filter: $FILTER_FORMAT"
     fi
+    echo ""
+elif $INCREMENTAL_MODE; then
+    echo "🔁 INCREMENTAL MODE - Testing Step 3: Incremental Load"
+    echo "   Timestamp: $TEST_RUN_TIMESTAMP"
+    if [ -n "$FILTER_FORMAT" ]; then
+        echo "   Format filter: $FILTER_FORMAT"
+    fi
+    echo "   ⚡ Will run NEW workload on existing tables"
+    echo "   ⚡ Autoloader will process only new CDC events"
     echo ""
 else
     if [ -n "$FILTER_FORMAT" ]; then
@@ -567,7 +601,11 @@ run_test() {
     
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name"
+    if [ "$INCREMENTAL_MODE" = true ]; then
+        echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name [INCREMENTAL - Step 3]"
+    else
+        echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name"
+    fi
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Format: $format"
     echo "  Catalog: $catalog"
@@ -576,6 +614,9 @@ run_test() {
     echo "  Test Table: $table"
     echo "  Split Column Families: $split_option"
     echo "  Path: $path_prefix/"
+    if [ "$INCREMENTAL_MODE" = true ]; then
+        echo "  Mode: INCREMENTAL (reusing existing table/changefeed)"
+    fi
     echo ""
     
     # Build changefeed SQL based on parameters
@@ -605,8 +646,28 @@ WITH
     echo "$changefeed_sql" | sed 's/^/  /'
     echo ""
     
-    # Create fresh test table for this specific test
-    echo "📋 Creating test table: $table..."
+    # Skip table and changefeed creation in incremental mode
+    if [ "$INCREMENTAL_MODE" = true ]; then
+        echo "🔁 INCREMENTAL MODE: Skipping table/changefeed creation"
+        echo "   Using existing table: $table"
+        
+        # Verify table exists
+        local row_count
+        row_count=$(get_row_count "$table")
+        if [ -z "$row_count" ] || [ "$row_count" -eq 0 ]; then
+            echo "❌ Error: Table $table doesn't exist or is empty"
+            echo "   Run full test first: $0 $format"
+            return 1
+        fi
+        echo "   ✅ Table exists: $row_count rows"
+        echo ""
+        
+        # Skip to workload generation
+        local base_table=$(get_base_table_name "$table")
+        # Jump directly to incremental workload section (defined below)
+    else
+        # Create fresh test table for this specific test
+        echo "📋 Creating test table: $table..."
     if [[ "$base_table" == "simple_test" ]]; then
         # Generate SQL using Python helper
         local sql_commands
@@ -669,11 +730,12 @@ EOF
         fi
         
         echo "✅ $table created: $row_count rows (user0000000001-user0000010000, PK: $pk_columns)"
-    fi
+    fi  # End of table creation section
     echo ""
     
-    # Create changefeed using changefeed_helper.py
-    echo "🚀 Creating changefeed..."
+    # Create changefeed using changefeed_helper.py (skip in incremental mode)
+    if [ "$INCREMENTAL_MODE" != true ]; then
+        echo "🚀 Creating changefeed..."
     
     # Try to create changefeed - capture both stdout and stderr
     local create_output=$(python3 "$SCRIPTS_DIR/changefeed_helper.py" create-changefeed \
@@ -752,8 +814,10 @@ EOF
         psql "${crdb_creds[cockroachdb_url]}" -c "CANCEL JOB $job_id;" 2>&1 > /dev/null
         return
     fi
+    fi  # End of changefeed creation section (skip in incremental mode)
     
     # Run deterministic workload with UPDATEs, DELETEs, and INSERTs
+    # In incremental mode, this generates the SECOND workload
     echo ""
     echo "🏋️  Running workload (400 UPDATEs + 100 DELETEs + 50 INSERTs)..."
     
