@@ -1166,7 +1166,7 @@ class LakeflowConnect:
         else:
             return 'UNKNOWN'
     
-    def _add_cdc_metadata_to_dataframe(self, df, table_name: str = None, source_file: str = None):
+    def _add_cdc_metadata_to_dataframe(self, df, table_name: str = None, source_file: str = None, primary_key_columns: List[str] = None):
         """
         Add CDC metadata columns to DataFrame.
         
@@ -1177,6 +1177,7 @@ class LakeflowConnect:
             df: PySpark DataFrame (batch or streaming)
             table_name: Optional table name for snapshot cutoff lookup
             source_file: Optional source file path (for batch mode with literal file name)
+            primary_key_columns: Optional list of primary key column names (required for JSON format to extract keys from 'key' array)
             
         Returns:
             DataFrame with CDC metadata columns added:
@@ -1239,6 +1240,13 @@ class LakeflowConnect:
                 after_fields = df.schema['after'].dataType.fieldNames() if hasattr(df.schema['after'].dataType, 'fieldNames') else []
                 for field in after_fields:
                     df = df.withColumn(field, F.col(f"after.{field}"))
+            
+            # CRITICAL: Extract primary key from 'key' array for JSON format
+            # The 'key' column is an array like [1234] or [1234, 5678] for composite keys
+            # We need to extract these values into the actual PK column names
+            if primary_key_columns and 'key' in schema_columns:
+                for i, pk_col in enumerate(primary_key_columns):
+                    df = df.withColumn(pk_col, F.col("key").getItem(i))
             
             # Add CDC operation based on before/after + timestamp
             if snapshot_cutoff:
@@ -5835,7 +5843,8 @@ def load_and_merge_cdc_to_delta(
     
     df_enriched = temp_connector._add_cdc_metadata_to_dataframe(
         df_raw,
-        table_name=effective_table
+        table_name=effective_table,
+        primary_key_columns=primary_keys
     )
     
     if debug:
@@ -5891,6 +5900,28 @@ def load_and_merge_cdc_to_delta(
         print(f"      {all_cols[:15]}")
         if len(all_cols) > 15:
             print(f"      ... and {len(all_cols) - 15} more")
+        
+        # CRITICAL DIAGNOSTIC: Count operations BEFORE merge
+        print(f"   🔍 CDC operations in temp table (BEFORE merge):")
+        if '_cdc_operation' in all_cols:
+            op_counts_before = df_raw_events.groupBy("_cdc_operation").count().collect()
+            for row in op_counts_before:
+                print(f"      {row['_cdc_operation']}: {row['count']}")
+            
+            # DIAGNOSTIC: Check if DELETE timestamps are unique
+            timestamp_cols = [c for c in ['updated', '_cdc_timestamp', '__crdb__updated'] if c in all_cols]
+            if timestamp_cols and 'ycsb_key' in all_cols:
+                ts_col = timestamp_cols[0]
+                deletes_df = df_raw_events.filter(F.col("_cdc_operation") == "DELETE")
+                unique_delete_combos = deletes_df.select('ycsb_key', ts_col, '_cdc_operation').distinct().count()
+                total_deletes = deletes_df.count()
+                print(f"   🔍 DELETE timestamp analysis:")
+                print(f"      Total DELETE rows: {total_deletes}")
+                print(f"      Unique (key + {ts_col} + operation): {unique_delete_combos}")
+                if total_deletes != unique_delete_combos:
+                    print(f"      ⚠️  WARNING: {total_deletes - unique_delete_combos} DELETEs have duplicate (key+timestamp+operation)!")
+        else:
+            print(f"      ⚠️  No _cdc_operation column found!")
     
     df_all_events = merge_column_family_fragments(
         df_raw_events,
