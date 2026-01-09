@@ -1,0 +1,11 @@
+{
+  "_comment": "Template for Azure Blob Storage credentials for CockroachDB CDC changefeeds",
+  "_description": "Copy this to cockroachdb_cdc_azure.json and fill in your actual values",
+  "_instructions": "Set environment variables AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, AZURE_STORAGE_CONTAINER",
+  
+  "azure_storage_account": "${AZURE_STORAGE_ACCOUNT}",
+  "azure_storage_key": "${AZURE_STORAGE_KEY}",
+  "azure_storage_container": "${AZURE_STORAGE_CONTAINER}",
+  "changefeed_uri": "azure-blob://${AZURE_STORAGE_CONTAINER}?AZURE_ACCOUNT_NAME=${AZURE_STORAGE_ACCOUNT}&AZURE_ACCOUNT_KEY=${AZURE_STORAGE_KEY}"
+}
+
