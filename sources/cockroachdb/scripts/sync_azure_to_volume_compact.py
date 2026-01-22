@@ -102,10 +102,29 @@ def list_azure_files(azure_config, prefix):
 
 
 def list_volume_files(w, volume_path):
-    """List CDC files (both Parquet and JSON) in Volume."""
+    """
+    List CDC files (both Parquet and JSON) in Volume.
+    Returns a set of filenames (without directory path) for backward compatibility.
+    This allows the existing check to work with both flat and nested structures.
+    """
     try:
-        files = w.files.list_directory_contents(volume_path)
-        return {Path(f.path).name for f in files if f.path.endswith(('.parquet', '.ndjson', '.json'))}
+        def list_recursive(path):
+            """Recursively list all files in directory and subdirectories."""
+            filenames = set()
+            try:
+                items = w.files.list_directory_contents(path)
+                for item in items:
+                    if item.is_dir:
+                        # Recursively list subdirectories
+                        filenames.update(list_recursive(item.path))
+                    elif item.path.endswith(('.parquet', '.ndjson', '.json')):
+                        # Add filename (not full path) for backward compat
+                        filenames.add(Path(item.path).name)
+            except Exception:
+                pass  # Directory might not exist yet
+            return filenames
+        
+        return list_recursive(volume_path)
     except:
         return set()
 
@@ -119,7 +138,7 @@ def sync_files(azure_config, w, blobs, volume_path, existing, cache_dir: Path, u
         w: Databricks workspace client
         blobs: List of blob names to sync
         volume_path: Target volume path
-        existing: Set of existing filenames in volume
+        existing: Set of existing filenames in volume (flat list for backward compat)
         cache_dir: Persistent cache directory
         use_cache: Whether to use cache (default: True)
     
@@ -132,33 +151,65 @@ def sync_files(azure_config, w, blobs, volume_path, existing, cache_dir: Path, u
     copied = skipped = failed = cached = 0
     
     for blob_name in track(blobs, description="Syncing files..."):
-        filename = Path(blob_name).name
+        # Extract relative path from blob name (after the timestamp directory)
+        # Example: json/defaultdb/public/test-json_usertable_with_split/1769028478/_metadata/schema.json
+        #       -> _metadata/schema.json
+        blob_path = Path(blob_name)
+        parts = blob_path.parts
+        
+        # Find the index after the timestamp directory (10-digit number)
+        timestamp_idx = None
+        for i, part in enumerate(parts):
+            if part.isdigit() and len(part) == 10:
+                timestamp_idx = i
+                break
+        
+        if timestamp_idx is not None and timestamp_idx + 1 < len(parts):
+            # Get relative path after timestamp (preserves _metadata/ subdirectory)
+            relative_path = Path(*parts[timestamp_idx + 1:])
+        else:
+            # Fallback: just use filename (backward compat)
+            relative_path = Path(blob_path.name)
+        
+        # For backward compatibility with existing check
+        filename = blob_path.name
         
         if filename in existing:
             skipped += 1
             continue
         
         try:
-            # Check cache first
+            # Check cache first (use flat filename for cache to keep it simple)
             cached_file = cache_dir / filename
             
             if use_cache and cached_file.exists():
                 # Use cached file (no download needed!)
                 cached += 1
-                console.print(f"  [cyan]⚡ {filename} (from cache)[/cyan]", highlight=False)
+                console.print(f"  [cyan]⚡ {relative_path} (from cache)[/cyan]", highlight=False)
             else:
                 # Download from Azure and save to cache
                 blob_client = container.get_blob_client(blob_name)
                 cached_file.write_bytes(blob_client.download_blob().readall())
-                console.print(f"  [green]⬇️  {filename} (downloaded)[/green]", highlight=False)
+                console.print(f"  [green]⬇️  {relative_path} (downloaded)[/green]", highlight=False)
             
-            # Upload to Volume from cache
+            # Upload to Volume preserving directory structure
+            target_path = f"{volume_path}/{relative_path}"
+            
+            # Create parent directory if needed (for _metadata/ subdirectory)
+            if relative_path.parent != Path('.'):
+                parent_dir = f"{volume_path}/{relative_path.parent}"
+                try:
+                    w.files.create_directory(parent_dir)
+                except Exception:
+                    pass  # Directory might already exist
+            
+            # Upload file
             with open(cached_file, 'rb') as f:
-                w.files.upload(f"{volume_path}/{filename}", f)
+                w.files.upload(target_path, f)
             
             copied += 1
         except Exception as e:
-            console.print(f"[red]✗ {filename}: {e}[/red]")
+            console.print(f"[red]✗ {relative_path}: {e}[/red]")
             failed += 1
     
     return copied, skipped, failed, cached

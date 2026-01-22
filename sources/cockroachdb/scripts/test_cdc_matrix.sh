@@ -27,10 +27,16 @@ WORKLOAD_DELETE_COUNT=100
 FILTER_FORMAT=""
 VALIDATE_ONLY=false
 INCREMENTAL_MODE=false
+LIST_TIMESTAMPS=false
+RESYNC_MODE=false
 TEST_RUN_TIMESTAMP=$(date +%s)
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --list-timestamps|-l)
+            LIST_TIMESTAMPS=true
+            shift
+            ;;
         --validate-only|-v)
             VALIDATE_ONLY=true
             # Check if next arg is a timestamp
@@ -58,6 +64,19 @@ while [ $# -gt 0 ]; do
             fi
             shift
             ;;
+        --resync|-r)
+            RESYNC_MODE=true
+            # Check if next arg is a timestamp
+            if [ $# -gt 1 ] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                TEST_RUN_TIMESTAMP="$2"
+                shift
+            else
+                # Find latest timestamp from Azure
+                echo "🔍 Finding latest test run timestamp for resync..."
+                TEST_RUN_TIMESTAMP="latest"
+            fi
+            shift
+            ;;
         json|parquet)
             FILTER_FORMAT="$1"
             shift
@@ -71,6 +90,16 @@ while [ $# -gt 0 ]; do
             echo "    $0 json             # Test only JSON format"
             echo "    $0 parquet          # Test only Parquet format"
             echo ""
+            echo "  List Available Timestamps:"
+            echo "    $0 --list-timestamps            # Show all test run timestamps"
+            echo "    $0 --list-timestamps json       # Show JSON test run timestamps"
+            echo "    $0 -l                           # Short form"
+            echo ""
+            echo "  Resync Mode:"
+            echo "    $0 --resync                     # Re-sync latest test data from Azure to Volume"
+            echo "    $0 --resync 1767895046          # Re-sync specific timestamp"
+            echo "    $0 -r json                      # Re-sync latest JSON tests only"
+            echo ""
             echo "  Incremental Mode:"
             echo "    $0 --incremental                # Run incremental workload on latest test"
             echo "    $0 --incremental 1767895046     # Run incremental on specific timestamp"
@@ -82,9 +111,16 @@ while [ $# -gt 0 ]; do
             echo "    $0 -v json                      # Validate latest JSON tests only"
             echo ""
             echo "Options:"
+            echo "  -l, --list-timestamps  List available test run timestamps in Azure"
+            echo "  -r, --resync         Re-sync existing test data from Azure to Volume (useful after code changes)"
             echo "  -i, --incremental    Run incremental workload on existing data (tests Step 3)"
             echo "  -v, --validate-only  Skip changefeed creation, analyze existing files"
             echo "  -h, --help           Show this help message"
+            echo ""
+            echo "Resync mode re-syncs existing Azure data to Volume:"
+            echo "  • Useful after updating sync script (e.g., _metadata/ directory changes)"
+            echo "  • Preserves existing test data in Azure"
+            echo "  • Updates Volume with latest directory structure"
             echo ""
             echo "Incremental mode tests CDC incremental processing by:"
             echo "  • Running a new workload on existing tables"
@@ -111,6 +147,15 @@ if $VALIDATE_ONLY; then
     if [ -n "$FILTER_FORMAT" ]; then
         echo "   Format filter: $FILTER_FORMAT"
     fi
+    echo ""
+elif $RESYNC_MODE; then
+    echo "🔄 RESYNC MODE - Re-syncing Azure data to Volume"
+    echo "   Timestamp: $TEST_RUN_TIMESTAMP"
+    if [ -n "$FILTER_FORMAT" ]; then
+        echo "   Format filter: $FILTER_FORMAT"
+    fi
+    echo "   ⚡ Will preserve existing Azure data"
+    echo "   ⚡ Will update Volume directory structure"
     echo ""
 elif $INCREMENTAL_MODE; then
     echo "🔁 INCREMENTAL MODE - Testing Step 3: Incremental Load"
@@ -190,6 +235,134 @@ find_latest_timestamp() {
     echo "$timestamps"
 }
 
+# Helper function to list all test timestamps from Azure
+list_all_timestamps() {
+    local format_prefix=""
+    if [ -n "$FILTER_FORMAT" ]; then
+        format_prefix="$FILTER_FORMAT/"
+    fi
+    
+    echo "📅 Available Test Run Timestamps in Azure"
+    echo "=========================================="
+    if [ -n "$FILTER_FORMAT" ]; then
+        echo "Format filter: $FILTER_FORMAT only"
+    else
+        echo "All formats (JSON and Parquet)"
+    fi
+    echo ""
+    
+    # Get all unique timestamps
+    local timestamps=$(az storage blob list \
+        --account-name "${azure_creds[azure_storage_account]}" \
+        --account-key "${azure_creds[azure_storage_key]}" \
+        --container-name changefeed-events \
+        --prefix "${format_prefix}" \
+        --query "[].name" \
+        --output tsv 2>/dev/null | \
+        grep -oE '[0-9]{10}/' | \
+        sort -u -r | \
+        tr -d '/')
+    
+    if [ -z "$timestamps" ]; then
+        echo "❌ No test data found in Azure"
+        if [ -n "$FILTER_FORMAT" ]; then
+            echo "   No $FILTER_FORMAT tests found"
+        else
+            echo "   Run a full test first: $0"
+        fi
+        exit 1
+    fi
+    
+    local count=0
+    echo "Timestamp    | Date & Time (UTC)         | Age        | Formats Available"
+    echo "-------------|---------------------------|------------|------------------"
+    
+    for ts in $timestamps; do
+        count=$((count + 1))
+        
+        # Convert timestamp to human-readable date
+        if command -v date >/dev/null 2>&1; then
+            # macOS and Linux compatible date conversion
+            if date -u -r "$ts" "+%Y-%m-%d %H:%M:%S" >/dev/null 2>&1; then
+                # BSD date (macOS)
+                local human_date=$(date -u -r "$ts" "+%Y-%m-%d %H:%M:%S")
+            elif date -u -d "@$ts" "+%Y-%m-%d %H:%M:%S" >/dev/null 2>&1; then
+                # GNU date (Linux)
+                local human_date=$(date -u -d "@$ts" "+%Y-%m-%d %H:%M:%S")
+            else
+                local human_date="(date conversion unavailable)"
+            fi
+        else
+            local human_date="(date command not found)"
+        fi
+        
+        # Calculate age
+        local now=$(date +%s)
+        local age_seconds=$((now - ts))
+        local age_days=$((age_seconds / 86400))
+        local age_hours=$(((age_seconds % 86400) / 3600))
+        local age_str=""
+        
+        if [ $age_days -gt 0 ]; then
+            age_str="${age_days}d ${age_hours}h ago"
+        elif [ $age_hours -gt 0 ]; then
+            age_str="${age_hours}h ago"
+        else
+            local age_minutes=$((age_seconds / 60))
+            age_str="${age_minutes}m ago"
+        fi
+        
+        # Check which formats exist for this timestamp
+        local json_count=$(az storage blob list \
+            --account-name "${azure_creds[azure_storage_account]}" \
+            --account-key "${azure_creds[azure_storage_key]}" \
+            --container-name changefeed-events \
+            --prefix "json/" \
+            --query "[?contains(name, '/$ts/')]" \
+            --output tsv 2>/dev/null | wc -l | tr -d ' ')
+        
+        local parquet_count=$(az storage blob list \
+            --account-name "${azure_creds[azure_storage_account]}" \
+            --account-key "${azure_creds[azure_storage_key]}" \
+            --container-name changefeed-events \
+            --prefix "parquet/" \
+            --query "[?contains(name, '/$ts/')]" \
+            --output tsv 2>/dev/null | wc -l | tr -d ' ')
+        
+        local formats=""
+        if [ "$json_count" -gt 0 ]; then
+            formats="JSON ($json_count files)"
+        fi
+        if [ "$parquet_count" -gt 0 ]; then
+            if [ -n "$formats" ]; then
+                formats="$formats, "
+            fi
+            formats="${formats}Parquet ($parquet_count files)"
+        fi
+        
+        if [ -z "$formats" ]; then
+            formats="(no files)"
+        fi
+        
+        # Mark latest
+        if [ $count -eq 1 ]; then
+            printf "%-12s | %-25s | %-10s | %s ⭐ LATEST\n" "$ts" "$human_date" "$age_str" "$formats"
+        else
+            printf "%-12s | %-25s | %-10s | %s\n" "$ts" "$human_date" "$age_str" "$formats"
+        fi
+    done
+    
+    echo ""
+    echo "Total: $count test run(s) found"
+    echo ""
+    echo "💡 Usage examples:"
+    echo "   Validate latest:           $0 --validate-only"
+    echo "   Validate specific:         $0 --validate-only $ts"
+    echo "   Incremental on latest:     $0 --incremental"
+    echo "   Incremental on specific:   $0 --incremental $ts"
+    echo ""
+}
+
 # Check if yq is available (still needed for bash associative array population)
 if ! command -v yq &> /dev/null; then
     echo "❌ Error: yq is required to parse JSON credentials"
@@ -220,8 +393,14 @@ fi
 # URL encode the Azure key using jq
 ENCODED_KEY=$(echo -n "${azure_creds[azure_storage_key]}" | jq -sRr @uri)
 
-# Resolve "latest" timestamp if in validation mode
-if $VALIDATE_ONLY && [ "$TEST_RUN_TIMESTAMP" = "latest" ]; then
+# Handle list-timestamps mode (exit after listing)
+if $LIST_TIMESTAMPS; then
+    list_all_timestamps
+    exit 0
+fi
+
+# Resolve "latest" timestamp if in validation or resync mode
+if ($VALIDATE_ONLY || $RESYNC_MODE) && [ "$TEST_RUN_TIMESTAMP" = "latest" ]; then
     echo "🔍 Finding latest test timestamp in Azure..."
     TEST_RUN_TIMESTAMP=$(find_latest_timestamp)
     echo "   Found: $TEST_RUN_TIMESTAMP"
@@ -431,7 +610,20 @@ execute_sql() {
 # Helper function: Get row count from table
 get_row_count() {
     local table=$1
-    psql "${crdb_creds[cockroachdb_url]}" -t -c "SELECT count(*) FROM $table;" 2>/dev/null | tr -d ' '
+    # Temporarily disable set -e to handle errors gracefully
+    set +e
+    local result=$(psql "${crdb_creds[cockroachdb_url]}" -t -c "SELECT count(*) FROM $table;" 2>&1 | tr -d ' ')
+    local exit_code=$?
+    set -e
+    
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${RED}❌ Database connection error while counting rows${NC}" >&2
+        echo "Details: $result" >&2
+        return 1
+    fi
+    
+    echo "$result"
+    return 0
 }
 
 # Helper function: Verify row count matches expected value
@@ -505,9 +697,7 @@ validate_test() {
     
     local analysis_output=$(python3 "$SCRIPTS_DIR/changefeed_helper.py" analyze-files \
         --format "$format" \
-        --account "${azure_creds[azure_storage_account]}" \
-        --key "${azure_creds[azure_storage_key]}" \
-        --container changefeed-events \
+        --azure-json "$AZURE_JSON" \
         --prefix "${path_prefix}/" \
         --table "$table" \
         --debug 2>&1)
@@ -578,6 +768,76 @@ validate_test() {
     echo -e "${result_color}${result_status}${NC}"
     
     echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name - VALIDATED (files=$file_count, rows: snap=$snapshot_rows ins=$insert_rows upd=$update_rows del=$delete_rows)" >> "$RESULTS_FILE"
+}
+
+# Function to resync test data from Azure to Volume (resync mode only)
+resync_test() {
+    local format=$1
+    local base_table=$2
+    local split_option=$3
+    local test_name="${format}_${base_table}_${split_option}"
+    
+    local table="test_${test_name}"
+    local catalog="defaultdb"
+    local schema="public"
+    local path_prefix="${format}/${catalog}/${schema}/test-${test_name}/${TEST_RUN_TIMESTAMP}"
+    
+    TEST_NUM=$((TEST_NUM + 1))
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Resync $TEST_NUM/$TOTAL_TESTS: $test_name"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Format: $format"
+    echo "  Base Table: $base_table"
+    echo "  Split Option: $split_option"
+    echo "  Path: $path_prefix/"
+    echo ""
+    
+    # Check if files exist in Azure
+    local file_ext=".ndjson"
+    if [ "$format" = "parquet" ]; then
+        file_ext=".parquet"
+    fi
+    
+    local file_count=$(count_azure_blobs "$path_prefix" "$file_ext")
+    
+    if [ "$file_count" -eq 0 ]; then
+        echo "⚠️  No files found in Azure at path: $path_prefix/"
+        echo "   Skipping resync for this test"
+        echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name - SKIPPED (no Azure data)" >> "$RESULTS_FILE"
+        return
+    fi
+    
+    echo "📊 Found $file_count ${format} files in Azure"
+    echo ""
+    
+    # Resync to volume
+    echo "📦 Syncing to Unity Catalog Volume (preserving hierarchy)..."
+    echo "  Prefix: ${path_prefix}/"
+    echo "  Subdir: ${path_prefix}"
+    echo "  Structure: format/catalog/schema/test-scenario/"
+    echo ""
+    
+    # Run sync and capture output
+    local sync_output=$(python3 "$SCRIPTS_DIR/sync_azure_to_volume_compact.py" --prefix "${path_prefix}" --subdir "${path_prefix}" 2>&1)
+    local sync_exit=$?
+    
+    # Show relevant output (skip progress bars, show summary)
+    echo "$sync_output" | grep -E "^(Volume:|Source files:|Synced:|✅|❌|⚠️)" || echo "$sync_output" | tail -10
+    
+    if [ $sync_exit -eq 0 ]; then
+        echo "✅ Files synced to volume: ${path_prefix}"
+        echo "   (Including _metadata/schema.json from Azure)"
+        echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name - RESYNCED (files=$file_count)" >> "$RESULTS_FILE"
+    else
+        echo "❌ Sync failed (exit code: $sync_exit)"
+        echo "   Full output:"
+        echo "$sync_output" | tail -20
+        echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name - FAILED (sync error)" >> "$RESULTS_FILE"
+    fi
+    
+    echo ""
 }
 
 # Function to run a single test
@@ -676,9 +936,26 @@ WITH
             --schema-type simple \
             --rows $SIMPLE_TEST_INITIAL_ROWS)
         
-        psql "${crdb_creds[cockroachdb_url]}" <<EOF 2>&1 | grep -E "DROP|CREATE|INSERT" || true
-$sql_commands
-EOF
+        # Temporarily disable set -e to capture psql errors
+        set +e
+        # Use echo pipe instead of heredoc to preserve exit code correctly
+        # Note: Don't use 'local' before capturing $? as it returns the exit code of 'local' (always 0)
+        psql_output=$(echo "$sql_commands" | psql "${crdb_creds[cockroachdb_url]}" 2>&1)
+        psql_exit=$?
+        set -e
+        
+        # Show filtered output (DROP/CREATE/INSERT lines)
+        echo "$psql_output" | grep -E "DROP|CREATE|INSERT" || true
+        
+        # Check for connection errors
+        if [ $psql_exit -ne 0 ]; then
+            echo -e "${RED}❌ Failed to create table (psql exit code: $psql_exit)${NC}"
+            echo "Full error output:"
+            echo "$psql_output" | head -10
+            echo ""
+            echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name - FAILED (table creation)" >> "$RESULTS_FILE"
+            return 1
+        fi
         
         # Verify primary key was set correctly
         local pk_columns
@@ -701,9 +978,26 @@ EOF
             --rows $USERTABLE_INITIAL_ROWS \
             $families_flag)
         
-        psql "${crdb_creds[cockroachdb_url]}" <<EOF 2>&1 | grep -E "DROP|CREATE|INSERT" || true
-$sql_commands
-EOF
+        # Temporarily disable set -e to capture psql errors
+        set +e
+        # Use echo pipe instead of heredoc to preserve exit code correctly
+        # Note: Don't use 'local' before capturing $? as it returns the exit code of 'local' (always 0)
+        psql_output=$(echo "$sql_commands" | psql "${crdb_creds[cockroachdb_url]}" 2>&1)
+        psql_exit=$?
+        set -e
+        
+        # Show filtered output (DROP/CREATE/INSERT lines)
+        echo "$psql_output" | grep -E "DROP|CREATE|INSERT" || true
+        
+        # Check for connection errors
+        if [ $psql_exit -ne 0 ]; then
+            echo -e "${RED}❌ Failed to create table (psql exit code: $psql_exit)${NC}"
+            echo "Full error output:"
+            echo "$psql_output" | head -10
+            echo ""
+            echo "Test $TEST_NUM/$TOTAL_TESTS: $test_name - FAILED (table creation)" >> "$RESULTS_FILE"
+            return 1
+        fi
         
         # Verify table creation and count
         local target_rows=$USERTABLE_INITIAL_ROWS
@@ -730,7 +1024,8 @@ EOF
         fi
         
         echo "✅ $table created: $row_count rows (user0000000001-user0000010000, PK: $pk_columns)"
-    fi  # End of table creation section
+    fi  # End of table creation section (simple_test vs usertable)
+    fi  # End of INCREMENTAL_MODE check (skip table creation)
     echo ""
     
     # Create changefeed using changefeed_helper.py (skip in incremental mode)
@@ -764,21 +1059,25 @@ EOF
     echo "✅ Changefeed created: Job $job_id"
     echo ""
     
-    # Create schema file
-    echo "📄 Creating schema file..."
+    # Create schema file in Azure (will be synced to volume)
+    echo "📄 Creating schema file in Azure..."
     local schema_output=$(python3 "$SCRIPTS_DIR/changefeed_helper.py" create-schema-file \
         --table "$table" \
         --json "$CRDB_JSON" \
-        --account "${azure_creds[azure_account]}" \
-        --key "${azure_creds[azure_key]}" \
-        --container "changefeed-events" \
+        --azure-json "$AZURE_JSON" \
         --prefix "$path_prefix" 2>&1)
     
     if echo "$schema_output" | grep -q "✅ Schema file created"; then
         echo "$schema_output"
     else
-        echo -e "${YELLOW}⚠️  Failed to create schema file (non-fatal)${NC}"
+        echo -e "${RED}❌ Failed to create schema file - this will cause notebook failures!${NC}"
         echo "$schema_output"
+        echo ""
+        echo "This is a critical error. Schema file is required for:"
+        echo "  - Primary key detection in load_and_merge_cdc_to_delta()"
+        echo "  - Column family detection"
+        echo "  - Automated testing"
+        return 1
     fi
     echo ""
     
@@ -932,9 +1231,7 @@ EOF
     # Use changefeed_helper.py to analyze the files (with debug for detailed output)
     local analysis_output=$(python3 "$SCRIPTS_DIR/changefeed_helper.py" analyze-files \
         --format "$format" \
-        --account "${azure_creds[azure_storage_account]}" \
-        --key "${azure_creds[azure_storage_key]}" \
-        --container changefeed-events \
+        --azure-json "$AZURE_JSON" \
         --prefix "${path_prefix}/" \
         --table "$table" \
         --debug 2>&1)
@@ -1063,6 +1360,7 @@ EOF
     
     if [ $sync_exit -eq 0 ]; then
         echo "✅ Files synced to volume with hierarchy: ${path_prefix}"
+        echo "   (Including _metadata/schema.json from Azure)"
     else
         echo "⚠️  Sync failed (exit code: $sync_exit) - continue anyway"
         echo "   Full output:"
@@ -1085,8 +1383,8 @@ EOF
     echo ""
 }
 
-# Cancel all existing changefeeds for test tables from previous runs (skip in validation mode)
-if ! $VALIDATE_ONLY; then
+# Cancel all existing changefeeds for test tables from previous runs (skip in validation and resync modes)
+if ! $VALIDATE_ONLY && ! $RESYNC_MODE; then
     echo "🧹 Cleaning up old test changefeeds and tables from previous runs..."
     if [ -n "$FILTER_FORMAT" ]; then
         echo "   (Only cleaning up $FILTER_FORMAT tests)"
@@ -1146,6 +1444,8 @@ for format in "${FORMATS[@]}"; do
         for split_option in "${SPLIT_OPTIONS[@]}"; do
             if $VALIDATE_ONLY; then
                 validate_test "$format" "$table" "$split_option"
+            elif $RESYNC_MODE; then
+                resync_test "$format" "$table" "$split_option"
             else
                 run_test "$format" "$table" "$split_option"
                 echo ""
@@ -1161,6 +1461,8 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if $VALIDATE_ONLY; then
     echo "📊 VALIDATION SUMMARY (Timestamp: $TEST_RUN_TIMESTAMP)"
+elif $RESYNC_MODE; then
+    echo "📊 RESYNC SUMMARY (Timestamp: $TEST_RUN_TIMESTAMP)"
 else
     echo "📊 TEST SUMMARY"
 fi
@@ -1172,6 +1474,8 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 if $VALIDATE_ONLY; then
     echo "✅ All validations complete!"
+elif $RESYNC_MODE; then
+    echo "✅ All resyncs complete!"
 else
     echo "✅ All tests complete!"
 fi
@@ -1189,6 +1493,16 @@ if $VALIDATE_ONLY; then
     echo "  ⚠️  SKIPPED (no data): $SKIPPED_COUNT/$TOTAL_TESTS"
     echo "  ❌ FAILED: $FAILED_COUNT/$TOTAL_TESTS"
     echo ""
+elif $RESYNC_MODE; then
+    RESYNCED_COUNT=$(grep "RESYNCED" "$RESULTS_FILE" | wc -l | tr -d ' ')
+    SKIPPED_COUNT=$(grep "SKIPPED" "$RESULTS_FILE" | wc -l | tr -d ' ')
+    FAILED_COUNT=$(grep "FAILED" "$RESULTS_FILE" | wc -l | tr -d ' ')
+    
+    echo "Summary:"
+    echo "  ✅ RESYNCED: $RESYNCED_COUNT/$TOTAL_TESTS"
+    echo "  ⚠️  SKIPPED (no Azure data): $SKIPPED_COUNT/$TOTAL_TESTS"
+    echo "  ❌ FAILED: $FAILED_COUNT/$TOTAL_TESTS"
+    echo ""
 else
     SUCCESS_COUNT=$(grep "SUCCESS" "$RESULTS_FILE" | wc -l | tr -d ' ')
     PARTIAL_COUNT=$(grep "PARTIAL" "$RESULTS_FILE" | wc -l | tr -d ' ')
@@ -1201,8 +1515,8 @@ else
     echo ""
 fi
 
-# List all running changefeeds (skip in validation mode)
-if ! $VALIDATE_ONLY; then
+# List all running changefeeds (skip in validation and resync modes)
+if ! $VALIDATE_ONLY && ! $RESYNC_MODE; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "📋 ACTIVE CHANGEFEEDS (Left Running for Testing)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1232,7 +1546,7 @@ if ! $VALIDATE_ONLY; then
     echo "✅ All test data has been synced to Unity Catalog Volume!"
 fi
 
-if ! $VALIDATE_ONLY; then
+if ! $VALIDATE_ONLY && ! $RESYNC_MODE; then
 echo ""
 echo "Each test uses production-style hierarchy (format/catalog/schema/test-scenario):"
 echo "  /Volumes/${UC_CATALOG}/${UC_SCHEMA}/${UC_VOLUME}/json/defaultdb/public/test-json_usertable_with_split/"

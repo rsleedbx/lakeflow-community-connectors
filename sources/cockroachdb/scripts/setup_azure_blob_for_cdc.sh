@@ -897,4 +897,3 @@ if [ -n "${credentials[managed_identity_type]:-}" ]; then
     echo "================================================================"
     echo ""
 fi
-

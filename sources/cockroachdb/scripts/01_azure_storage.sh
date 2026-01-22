@@ -80,7 +80,7 @@ fi
 
 # build URLs
 credentials[changefeed_uri]="azure-blob://${credentials[azure_storage_container]}?AZURE_ACCOUNT_NAME=${credentials[azure_storage_account]}&AZURE_ACCOUNT_KEY=${credentials[azure_storage_key]}"
-credentials[abfss_base_url]="abfss://${credentials[azure_storage_container]}@${credentials[azure_storage_account]}.dfs.core.windows.net"
+credentials[abfss_base_url]="abfss://${credentials[azure_storage_container]}@${credentials[azure_storage_account]}.dfs.core.windows.net"    # required by Databricks UI
 credentials[abfss_parquet_url]="${credentials[abfss_base_url]}/parquet-cdc"
 credentials[abfss_json_url]="${credentials[abfss_base_url]}/json-cdc"
 credentials[wasbs_base_url]="wasbs://${credentials[azure_storage_container]}@${credentials[azure_storage_account]}.blob.core.windows.net"
@@ -90,8 +90,10 @@ credentials[wasbs_json_url]="${credentials[wasbs_base_url]}/json-cdc"
 # save to JSON
 associative_array_to_json_file credentials "$JSON_FILE"
 
-echo "stopping as below code has permission error and won't work"
-kill -INT $$
+# #############################################################################
+# create manage identity 
+
+echo -e "\n\b Need IAM permission on storage account \n\n"
 
 # managed identity (user-assigned only)
 credentials[managed_identity_name]=${credentials[managed_identity_name]:-cockroachdb-cdc-identity-${credentials[timestamp]}}
@@ -99,14 +101,13 @@ if ! AZ identity show --name "${credentials[managed_identity_name]}" --resource-
     DB_EXIT_ON_ERROR="PRINT_EXIT" AZ identity create \
         --name "${credentials[managed_identity_name]}" \
         --resource-group "${credentials[resource_group]}"
+    # load identity details from either show or create
+    credentials[managed_identity_type]="user_assigned"
+    credentials[managed_identity_client_id]=$(jq -r '.clientId' /tmp/az_stdout.$$)
+    credentials[managed_identity_resource_id]=$(jq -r '.id' /tmp/az_stdout.$$)          # required by Databricks UI
+    credentials[managed_identity_principal_id]=$(jq -r '.principalId' /tmp/az_stdout.$$)
     associative_array_to_json_file credentials "$JSON_FILE"
 fi
-
-# load identity details from either show or create
-credentials[managed_identity_type]="user_assigned"
-credentials[managed_identity_client_id]=$(jq -r '.clientId' /tmp/az_stdout.$$)
-credentials[managed_identity_resource_id]=$(jq -r '.id' /tmp/az_stdout.$$)
-credentials[managed_identity_principal_id]=$(jq -r '.principalId' /tmp/az_stdout.$$)
 
 # get storage resource ID for RBAC
 if [[ -z "${credentials[storage_resource_id]:-}" ]]; then
@@ -114,9 +115,8 @@ if [[ -z "${credentials[storage_resource_id]:-}" ]]; then
         --name "${credentials[azure_storage_account]}" \
         --resource-group "${credentials[resource_group]}"
     credentials[storage_resource_id]=$(jq -r '.id' /tmp/az_stdout.$$)
+    associative_array_to_json_file credentials "$JSON_FILE"
 fi
-
-associative_array_to_json_file credentials "$JSON_FILE"
 
 # #############################################################################
 # Optional: Assign RBAC roles to managed identity for enhanced Databricks functionality
@@ -171,7 +171,7 @@ assign_managed_identity_roles() {
 
 # Skip RBAC role assignments by default (uncomment to enable)
 # Requires Owner or User Access Administrator permissions
-assign_managed_identity_roles
+# assign_managed_identity_roles
 
 # create access connector for Databricks Unity Catalog (ignore error if permission denied)
 credentials[access_connector_name]=${credentials[access_connector_name]:-cockroachdb-cdc-access-connector-${credentials[timestamp]}}
@@ -185,18 +185,23 @@ if ! AZ databricks access-connector show \
         --location "${CLOUD_LOCATION}" \
         --identity-type UserAssigned \
         --user-assigned-identities "{\"${credentials[managed_identity_resource_id]}\": {}}"
+    credentials[access_connector_id]=$(jq -r '.id // empty' /tmp/az_stdout.$$)      # required by Databricks UI
+    associative_array_to_json_file credentials "$JSON_FILE"
 fi
 
 # load access connector ID from either show or create
-credentials[access_connector_id]=$(jq -r '.id // empty' /tmp/az_stdout.$$)
+if [[ -z "${credentials[access_connector_id]:-}" ]]; then
+    echo "setting access_connector_id ${credentials[access_connector_id]:-}"
+
+    credentials[access_connector_id]=$(jq -r '.id // empty' /tmp/az_stdout.$$)
+    associative_array_to_json_file credentials "$JSON_FILE"
+fi
 
 # Validate access connector ID was retrieved
 if [[ -z "${credentials[access_connector_id]}" ]]; then
     echo "⚠️  Warning: Could not retrieve Access Connector ID"
     echo "   Unity Catalog setup may require manual configuration"
 fi
-
-
 
 # #############################################################################
 # Unity Catalog Setup
@@ -221,10 +226,14 @@ fi
 # Initialize Databricks CLI and get current user
 DBX_INIT
 
-# Configuration - use timestamp suffix to associate with Azure resources
-credentials[unity_catalog__storage_credential_name]="cockroachdb_cdc_storage_credential_${credentials[timestamp]}"
-credentials[unity_catalog__parquet_location_name]="cockroachdb_cdc_parquet_${credentials[timestamp]}"
-credentials[unity_catalog__json_location_name]="cockroachdb_cdc_json_${credentials[timestamp]}"
+# Configuration - Databricks UI uses concatenated 
+# External Location Name + _ + azuremanagedidendity_$(date +%s%6)
+# Connector Id: /subscriptions/xxx/resourceGroups/cockroachdb-cdc-rg/providers/Microsoft.Databricks/accessConnectors/cockroachdb-cdc-access-connector-1768934658
+# User Assigned Managed Identity Id: /subscriptions/xxx/resourcegroups/cockroachdb-cdc-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/cockroachdb-cdc-identity-1768934658
+
+if [[ -z "${credentials[unity_catalog__storage_credential_name]:-}" ]]; then
+    credentials[unity_catalog__storage_credential_name]="${credentials[azure_storage_account]}"
+fi
 
 if ! DBX storage-credentials get "${credentials[unity_catalog__storage_credential_name]}"; then    
     storage_cred_json=$(cat <<EOF
@@ -232,7 +241,8 @@ if ! DBX storage-credentials get "${credentials[unity_catalog__storage_credentia
   "name": "${credentials[unity_catalog__storage_credential_name]}",
   "comment": "CockroachDB CDC changefeeds",
   "azure_managed_identity": {
-    "access_connector_id": "${credentials[access_connector_id]}"
+    "access_connector_id": "${credentials[access_connector_id]}",
+    "managed_identity_id": "${credentials[managed_identity_resource_id]}"
   },
   "read_only": false,
   "skip_validation": false
@@ -240,36 +250,28 @@ if ! DBX storage-credentials get "${credentials[unity_catalog__storage_credentia
 EOF
 )
     DB_EXIT_ON_ERROR="PRINT_EXIT" DBX storage-credentials create --json "$storage_cred_json"
+    associative_array_to_json_file credentials "$JSON_FILE"
 fi
 
-if ! DBX external-locations get "${credentials[unity_catalog__parquet_location_name]}"; then
+# fallback if json file is missing the id\
+if [[ -z "${credentials[unity_catalog__storage_credential_id]:-}" ]]; then
+    echo "setting storage_credential_id ${credentials[unity_catalog__storage_credential_id]:-}"
+    credentials[unity_catalog__storage_credential_id]=$(jq -r '.id // empty' /tmp/dbx_stdout.$$)
+    associative_array_to_json_file credentials "$JSON_FILE"
+fi
+
+# create external location if not exists
+
+if [[ -z "${credentials[unity_catalog__external_location]:-}" ]]; then
+    credentials[unity_catalog__external_location]="${credentials[azure_storage_account]}"
+fi
+
+if ! DBX external-locations get "${credentials[unity_catalog__external_location]}"; then
     DB_EXIT_ON_ERROR="PRINT_EXIT" DBX external-locations create \
-        --name "${credentials[unity_catalog__parquet_location_name]}" \
-        --url "${credentials[abfss_parquet_url]}" \
-        --credential-name "${credentials[unity_catalog__storage_credential_name]}" \
-        --comment "CockroachDB CDC Parquet" \
-        --read-only false \
-        --skip-validation false
+        "${credentials[unity_catalog__external_location]}" \
+        "${credentials[abfss_base_url]}" \
+        "${credentials[unity_catalog__storage_credential_name]}" \
+        --comment "CockroachDB CDC" 
+    # Save all credentials to JSON
+    associative_array_to_json_file credentials "$JSON_FILE"
 fi
-
-if ! DBX external-locations get "${credentials[unity_catalog__json_location_name]}"; then
-    DB_EXIT_ON_ERROR="PRINT_EXIT" DBX external-locations create \
-        --name "${credentials[unity_catalog__json_location_name]}" \
-        --url "${credentials[abfss_json_url]}" \
-        --credential-name "${credentials[unity_catalog__storage_credential_name]}" \
-        --comment "CockroachDB CDC JSON" \
-        --read-only false \
-        --skip-validation false
-fi
-
-for location in "${credentials[unity_catalog__parquet_location_name]}" "${credentials[unity_catalog__json_location_name]}"; do
-    DB_EXIT_ON_ERROR="PRINT_EXIT" DBX grants update \
-        --securable-type EXTERNAL_LOCATION \
-        --name "$location" \
-        --principal "$DBX_USERNAME" \
-        --changes '[{"add": ["READ_FILES"]}]'
-done
-
-# Save all credentials to JSON
-associative_array_to_json_file credentials "$JSON_FILE"
-

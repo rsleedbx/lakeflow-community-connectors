@@ -37,7 +37,9 @@ echo "════════════════════════�
 echo "Step 1: Verify Volume Has Files"
 echo "═══════════════════════════════════════════════════════════════"
 
-FILE_COUNT=$(databricks fs ls "${VOLUME_PATH}/" 2>/dev/null | grep -c '\.parquet$' || echo "0")
+# Note: 'databricks fs ls' does NOT work with Unity Catalog Volumes - use SDK instead
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FILE_COUNT=$(python3 "$SCRIPTS_DIR/list_volume_files.py" --count --pattern "*.parquet" "${VOLUME_PATH}/" 2>/dev/null || echo "0")
 
 if [ "$FILE_COUNT" -eq 0 ]; then
     echo "❌ No Parquet files found in Volume!"

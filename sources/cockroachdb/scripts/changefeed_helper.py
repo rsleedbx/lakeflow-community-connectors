@@ -27,8 +27,11 @@ Commands:
     execute-sql --sql SQL --json CRDB_JSON [--commit]
         Execute SQL query
         
-    analyze-files --format FORMAT --account ACCOUNT --key KEY --container CONTAINER [--prefix PREFIX]
+    analyze-files --format FORMAT --azure-json AZURE_JSON [--prefix PREFIX]
         Analyze changefeed files in Azure Blob Storage
+        
+    create-schema-file --table TABLE --json CRDB_JSON --azure-json AZURE_JSON --prefix PREFIX
+        Create and upload schema file to Azure
 """
 
 import sys
@@ -45,6 +48,23 @@ from cockroachdb import (
     get_primary_keys, generate_test_table_sql, generate_test_insert_sql,
     generate_test_update_sql, generate_test_delete_sql, get_timestamped_path
 )
+
+
+def load_azure_config(json_path: str) -> dict:
+    """Load Azure credentials from JSON file"""
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"Azure config file not found: {json_path}")
+    
+    with open(json_path, 'r') as f:
+        config = json.load(f)
+    
+    # Validate required fields
+    required_fields = ['azure_storage_account', 'azure_storage_key']
+    for field in required_fields:
+        if field not in config:
+            raise ValueError(f"Missing required field '{field}' in Azure config: {json_path}")
+    
+    return config
 
 
 def cmd_find_changefeeds(args):
@@ -334,6 +354,14 @@ def cmd_get_timestamped_path(args):
 
 def cmd_analyze_files(args):
     """Analyze changefeed files in Azure Blob Storage."""
+    # Parse Azure config from JSON file
+    azure_config_raw = load_azure_config(args.azure_json)
+    
+    # Extract Azure credentials
+    account_name = azure_config_raw['azure_storage_account']
+    account_key = azure_config_raw['azure_storage_key']
+    container = azure_config_raw.get('azure_container', 'changefeed-events')
+    
     format_type = args.format.lower()
     
     # Validate format
@@ -365,8 +393,8 @@ def cmd_analyze_files(args):
     
     # Analyze changefeed files
     print(f"📊 Analyzing {format_type.upper()} changefeed files...")
-    print(f"   Account: {args.account}")
-    print(f"   Container: {args.container}")
+    print(f"   Account: {account_name}")
+    print(f"   Container: {container}")
     print(f"   Prefix: {path_prefix or '(root)'}")
     if primary_key_columns:
         print(f"   Primary keys: {primary_key_columns}")
@@ -376,9 +404,9 @@ def cmd_analyze_files(args):
     
     try:
         total_stats = analyze_azure_changefeed_files(
-            account_name=args.account,
-            account_key=args.key,
-            container_name=args.container,
+            account_name=account_name,
+            account_key=account_key,
+            container_name=container,
             path_prefix=path_prefix,
             format_type=format_type,
             primary_key_columns=primary_key_columns,
@@ -443,98 +471,50 @@ def cmd_analyze_files(args):
 
 
 def cmd_create_schema_file(args):
-    """Create and upload schema file for a table to Azure"""
-    import psycopg2
-    from azure.storage.blob import BlobServiceClient
-    from datetime import datetime
+    """Create and upload schema file for a table to Azure (uses existing cockroachdb.py code)"""
+    from cockroachdb import create_connector
     
     # Parse CockroachDB config
     crdb_config = load_crdb_config(args.json)
     
-    # Connect to CockroachDB to get schema
-    try:
-        conn = psycopg2.connect(crdb_config['connection_url'])
-        cursor = conn.cursor()
-        
-        # Get table metadata
-        catalog = crdb_config.get('catalog', 'defaultdb')
-        schema = crdb_config.get('schema', 'public')
-        table_name = args.table
-        
-        # Get CREATE TABLE statement
-        cursor.execute("SHOW CREATE TABLE %s.%s.%s" % (catalog, schema, table_name))
-        result = cursor.fetchone()
-        create_statement = result[1] if result else ""
-        
-        # Get primary keys
-        pk_query = """
-            SELECT kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu 
-              ON tc.constraint_name = kcu.constraint_name
-              AND tc.table_schema = kcu.table_schema
-              AND tc.table_name = kcu.table_name
-            WHERE tc.constraint_type = 'PRIMARY KEY'
-              AND tc.table_schema = %s
-              AND tc.table_name = %s
-            ORDER BY kcu.ordinal_position
-        """
-        cursor.execute(pk_query, (schema, table_name))
-        primary_keys = [row[0] for row in cursor.fetchall()]
-        
-        # Get column information
-        col_query = """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = %s 
-              AND table_name = %s
-            ORDER BY ordinal_position
-        """
-        cursor.execute(col_query, (schema, table_name))
-        columns = [
-            {
-                'name': row[0],
-                'type': row[1],
-                'nullable': row[2] == 'YES'
-            }
-            for row in cursor.fetchall()
-        ]
-        
-        # Check for column families
-        has_column_families = create_statement.upper().count('FAMILY ') > 1
-        
-        cursor.close()
-        conn.close()
-        
-        # Build schema info
-        schema_info = {
-            'table_name': table_name,
-            'catalog': catalog,
-            'schema': schema,
-            'primary_keys': primary_keys,
-            'columns': columns,
-            'create_statement': create_statement,
-            'has_column_families': has_column_families,
-            'schema_version': 1,
-            'created_at': datetime.utcnow().isoformat() + 'Z'
-        }
-        
-    except Exception as e:
-        print(f"❌ Failed to get schema from CockroachDB: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Parse Azure config from JSON file
+    azure_config_raw = load_azure_config(args.azure_json)
     
-    # Upload to Azure
+    # Extract Azure credentials
+    account_name = azure_config_raw['azure_storage_account']
+    account_key = azure_config_raw['azure_storage_key']
+    container = azure_config_raw.get('azure_container', 'changefeed-events')
+    
+    # Create connector (uses pg8000 internally)
+    catalog = crdb_config.get('catalog', 'defaultdb')
+    schema = crdb_config.get('schema', 'public')
+    
+    # Build Azure config for connector
+    azure_config = {
+        'account_name': account_name,
+        'account_key': account_key,
+        'container': container
+    }
+    
     try:
+        # Create connector with Azure config
+        connector = create_connector(crdb_config, catalog, schema, azure_config)
+        
+        # Dump table schema (uses existing _dump_table_schema method with pg8000)
+        schema_info = connector._dump_table_schema(args.table)
+        
+        # Upload directly to Azure at the specified prefix path
+        from azure.storage.blob import BlobServiceClient
         blob_service_client = BlobServiceClient(
-            account_url=f"https://{args.account}.blob.core.windows.net",
-            credential=args.key
+            account_url=f"https://{account_name}.blob.core.windows.net",
+            credential=account_key
         )
         
-        # Schema file path: {prefix}/_schema.json
-        schema_blob_name = f"{args.prefix}/_schema.json"
+        # Schema file path: {prefix}/_metadata/schema.json
+        schema_blob_name = f"{args.prefix}/_metadata/schema.json"
         
         blob_client = blob_service_client.get_blob_client(
-            container=args.container,
+            container=container,
             blob=schema_blob_name
         )
         
@@ -542,11 +522,11 @@ def cmd_create_schema_file(args):
         schema_json = json.dumps(schema_info, indent=2)
         blob_client.upload_blob(schema_json, overwrite=True)
         
-        print(f"✅ Schema file created: {args.container}/{schema_blob_name}")
+        print(f"✅ Schema file created in Azure: {container}/{schema_blob_name}")
         if args.debug:
-            print(f"   Primary keys: {primary_keys}")
-            print(f"   Columns: {len(columns)}")
-            print(f"   Column families: {has_column_families}")
+            print(f"   Primary keys: {schema_info['primary_keys']}")
+            print(f"   Columns: {len(schema_info['columns'])}")
+            print(f"   Has column families: {schema_info['has_column_families']}")
         
     except Exception as e:
         print(f"❌ Failed to upload schema to Azure: {e}", file=sys.stderr)
@@ -648,18 +628,14 @@ def main():
     schema_parser = subparsers.add_parser('create-schema-file', help='Create and upload schema file to Azure')
     schema_parser.add_argument('--table', required=True, help='Table name')
     schema_parser.add_argument('--json', required=True, help='Path to CockroachDB credentials JSON')
-    schema_parser.add_argument('--account', required=True, help='Azure storage account name')
-    schema_parser.add_argument('--key', required=True, help='Azure storage account key')
-    schema_parser.add_argument('--container', default='changefeed-events', help='Azure container name (default: changefeed-events)')
+    schema_parser.add_argument('--azure-json', required=True, help='Path to Azure credentials JSON')
     schema_parser.add_argument('--prefix', required=True, help='Path prefix (e.g., parquet/defaultdb/public/test-parquet_simple_test_no_split/1767823340)')
     schema_parser.add_argument('--debug', action='store_true', help='Enable debug output')
     
     # analyze-files command
     analyze_parser = subparsers.add_parser('analyze-files', help='Analyze changefeed files in Azure')
     analyze_parser.add_argument('--format', required=True, choices=['parquet', 'json'], help='Changefeed format')
-    analyze_parser.add_argument('--account', required=True, help='Azure storage account name')
-    analyze_parser.add_argument('--key', required=True, help='Azure storage account key')
-    analyze_parser.add_argument('--container', default='changefeed-events', help='Azure container name (default: changefeed-events)')
+    analyze_parser.add_argument('--azure-json', required=True, help='Path to Azure credentials JSON')
     analyze_parser.add_argument('--prefix', help='Path prefix (default: auto-detected as parquet-cdc or json-cdc)')
     analyze_parser.add_argument('--table', help='Table name (used to infer primary key for deduplication)')
     analyze_parser.add_argument('--primary-keys', help='Comma-separated list of primary key columns (e.g., id,name)')

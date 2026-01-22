@@ -30,4 +30,3 @@ sources/**/.env/cockroachdb_pipelines.json
 
 # Local cache directories (test data)
 .cache/
-

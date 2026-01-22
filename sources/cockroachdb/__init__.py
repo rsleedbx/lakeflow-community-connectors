@@ -20,7 +20,8 @@ from .cockroachdb import (
     parse_volume_path,
     TestScenarioComponents,
     parse_test_scenario,
-    get_timestamped_path
+    get_timestamped_path,
+    ConnectorMode
 )
 
 __all__ = [
@@ -43,5 +44,6 @@ __all__ = [
     'parse_volume_path',
     'TestScenarioComponents',
     'parse_test_scenario',
-    'get_timestamped_path'
+    'get_timestamped_path',
+    'ConnectorMode'
 ]

@@ -1,4 +1,5 @@
 from typing import Dict, List, Iterator, Any
+from enum import Enum
 import json
 import ssl
 import os
@@ -27,6 +28,50 @@ except ImportError:
     BinaryType = type('BinaryType', (), {})
     DecimalType = type('DecimalType', (), {})
     ArrayType = type('ArrayType', (), {})
+
+
+class ConnectorMode(str, Enum):
+    """
+    Enumeration of connector operation modes.
+    
+    Modes:
+        VOLUME: Read JSON/Parquet files from Unity Catalog Volumes
+        AZURE_PARQUET: Read Parquet files from Azure Blob Storage
+        AZURE_JSON: Read JSON files from Azure Blob Storage
+        AZURE_DUAL: Read both JSON and Parquet from Azure Blob Storage
+        DIRECT: Direct sinkless changefeed connection (instream CDC)
+    """
+    VOLUME = "volume"
+    AZURE_PARQUET = "azure_parquet"
+    AZURE_JSON = "azure_json"
+    AZURE_DUAL = "azure_dual"
+    DIRECT = "direct"
+    
+    def __str__(self):
+        """Return the string value for compatibility with existing code."""
+        return self.value
+    
+    @classmethod
+    def from_string(cls, mode_str: str) -> 'ConnectorMode':
+        """
+        Convert string to ConnectorMode enum.
+        
+        Args:
+            mode_str: String representation of mode
+            
+        Returns:
+            ConnectorMode enum value
+            
+        Raises:
+            ValueError: If mode_str is not a valid mode
+        """
+        try:
+            return cls(mode_str)
+        except ValueError:
+            valid_modes = [m.value for m in cls]
+            raise ValueError(
+                f"Invalid mode '{mode_str}'. Valid modes: {valid_modes}"
+            )
 
 
 class LakeflowConnect:
@@ -145,9 +190,16 @@ class LakeflowConnect:
         # Parse connection credentials
         token = options.get("token")
         base_url = options.get("base_url")
+        # Check multiple URL key variants (handle typos)
+        connection_url = (options.get("connection_url") or 
+                         options.get("cockroachdb_url") or 
+                         options.get("cockrodb_url"))  # Handle typo variant
         
-        if token and base_url:
-            # GitHub-style: token + base_url
+        if connection_url:
+            # Direct URL format (highest priority)
+            self._parse_connection_url(connection_url)
+        elif token and base_url and token.strip() and base_url.strip():
+            # GitHub-style: token + base_url (check for non-empty strings)
             if base_url.startswith("postgresql://"):
                 full_url = f"postgresql://{token}@{base_url[13:]}"
                 self._parse_connection_url(full_url)
@@ -162,10 +214,23 @@ class LakeflowConnect:
             self.password = options.get("password", "")
             self.sslmode = options.get("sslmode", "require")
         else:
-            # No credentials provided
+            # No credentials provided (OK for volume-only mode)
             self.host = None
             self.database = None
             self.user = None
+            self.password = None
+            self.port = None
+            self.sslmode = None
+            
+            # Debug: Log what keys were found in options for troubleshooting
+            if options and any(k in options for k in ['token', 'base_url', 'connection_url', 'cockroachdb_url']):
+                import warnings
+                found_keys = [k for k in ['token', 'base_url', 'connection_url', 'cockroachdb_url', 'host'] if k in options]
+                warnings.warn(
+                    f"CockroachDB credentials found but not parsed. Keys in options: {found_keys}. "
+                    f"Check that token/base_url/cockroachdb_url values are non-empty strings.",
+                    UserWarning
+                )
         
         # Detect Volume path for volume-based reading
         self.volume_path = options.get("volume_path")
@@ -186,21 +251,21 @@ class LakeflowConnect:
         
         # Determine operation mode (priority: volume > azure > direct)
         if self.volume_path:
-            self.mode = "volume"
+            self.mode = ConnectorMode.VOLUME
             # print(f"Mode: Volume | Path: {self.volume_path}")  # Debug only
         elif self.azure_account_name and self.azure_account_key and self.azure_container:
             # Mode name depends on format
             if self.format == 'both':
-                self.mode = "azure_dual"
+                self.mode = ConnectorMode.AZURE_DUAL
                 # print(f"Mode: Azure Dual (JSON+Parquet) | Container: {self.azure_container}")  # Debug only
             elif self.format == 'json':
-                self.mode = "azure_json"
+                self.mode = ConnectorMode.AZURE_JSON
                 # print(f"Mode: Azure JSON | Container: {self.azure_container}")  # Debug only
             else:
-                self.mode = "azure_parquet"
+                self.mode = ConnectorMode.AZURE_PARQUET
                 # print(f"Mode: Azure Parquet | Container: {self.azure_container}")  # Debug only
         else:
-            self.mode = "direct"
+            self.mode = ConnectorMode.DIRECT
             # print(f"Mode: Direct Sinkless | Database: {self.database}")  # Debug only
         
         # Instance variable to track snapshot cutoff timestamp for UPDATE detection in Parquet
@@ -293,6 +358,157 @@ class LakeflowConnect:
         """Return fully qualified table name: catalog.schema.table"""
         return f"{self.catalog}.{self.schema}.{table_name}"
     
+    def _get_schema_from_files(self, table_name: str) -> StructType:
+        """
+        Get Spark schema for a table by reading from files (Volume or Azure).
+        
+        This method infers the schema by reading a sample data file, since the
+        _schema.json file only contains primary keys/column families, not full column types.
+        
+        Works for both:
+        - VOLUME mode: Reads from Unity Catalog Volumes
+        - AZURE modes: Reads from Azure Blob Storage
+        """
+        from pyspark.sql.types import StructType
+        
+        # VOLUME mode: Use volume files
+        if self.mode == ConnectorMode.VOLUME:
+            spark, dbutils = self._ensure_spark_and_dbutils(self._spark, self._dbutils)
+            
+            # Get file list from volume
+            file_list = self._list_volume_files(self.volume_path, spark=spark, dbutils=dbutils)
+            
+            if not file_list:
+                raise ValueError(f"No files found in volume: {self.volume_path}")
+            
+            # Filter out metadata files
+            data_files = [f for f in file_list if not f['name'].startswith('_')]
+            
+            if not data_files:
+                raise ValueError(f"No data files found in volume: {self.volume_path}")
+            
+            # Read first file to infer Spark schema
+            sample_file = data_files[0]
+            is_json = sample_file['name'].endswith(('.ndjson', '.json'))
+            file_path = sample_file['path']
+            
+        # AZURE modes: Use Azure blob files
+        else:
+            from azure.storage.blob import BlobServiceClient
+            from io import BytesIO
+            import pandas as pd
+            
+            spark, _ = self._ensure_spark_and_dbutils(self._spark, None)
+            
+            # Connect to Azure
+            self._ensure_azure_dependencies()
+            account_url = f"https://{self.azure_account_name}.blob.core.windows.net"
+            blob_service_client = BlobServiceClient(
+                account_url=account_url,
+                credential=self.azure_account_key
+            )
+            container_client = blob_service_client.get_container_client(self.azure_container)
+            
+            # Determine path prefix and format
+            if self.mode == ConnectorMode.AZURE_JSON or self.format == 'json':
+                path_prefix = self.json_path_prefix if hasattr(self, 'json_path_prefix') else f"json/{self.catalog}/{self.schema}/{table_name}"
+                is_json = True
+                file_ext = '.ndjson'
+            else:
+                path_prefix = self.parquet_path_prefix if hasattr(self, 'parquet_path_prefix') else f"parquet/{self.catalog}/{self.schema}/{table_name}"
+                is_json = False
+                file_ext = '.parquet'
+            
+            # List blobs (recursively includes subdirectories like date dirs)
+            blob_list = container_client.list_blobs(name_starts_with=path_prefix)
+            data_files = [blob for blob in blob_list 
+                         if file_ext in blob.name 
+                         and '/_metadata/' not in blob.name 
+                         and not blob.name.split('/')[-1].startswith('_')]
+            
+            if not data_files:
+                raise ValueError(f"No {file_ext} files found in Azure: {path_prefix}")
+            
+            # Read first file from Azure
+            sample_blob = data_files[0]
+            blob_client = blob_service_client.get_blob_client(container=self.azure_container, blob=sample_blob.name)
+            download_stream = blob_client.download_blob()
+            file_data = BytesIO(download_stream.readall())
+            
+            # For Azure, we need to read into Spark differently
+            # Use pandas as intermediate for small sample file
+            if is_json:
+                pdf = pd.read_json(file_data, lines=True)
+                df = spark.createDataFrame(pdf)
+            else:
+                pdf = pd.read_parquet(file_data)
+                df = spark.createDataFrame(pdf)
+            
+            return df.schema
+        
+        # For VOLUME mode, read file and infer schema
+        if is_json:
+            df = spark.read.json(file_path)
+        else:
+            df = spark.read.parquet(file_path)
+        
+        # Return inferred Spark schema (StructType with field names and types)
+        return df.schema
+    
+    def _get_metadata_from_files(self, table_name: str) -> Dict[str, Any]:
+        """
+        Get table metadata by reading from _schema.json file (Volume or Azure).
+        
+        Args:
+            table_name: Name of the table
+            
+        Returns:
+            Dictionary with primary_keys, cursor_field, ingestion_type
+        """
+        # VOLUME mode: Read from Unity Catalog Volume
+        if self.mode == ConnectorMode.VOLUME:
+            spark, dbutils = self._ensure_spark_and_dbutils(self._spark, self._dbutils)
+            
+            # Load schema metadata from _schema.json
+            schema_info = self._load_schema_from_volume(self.volume_path, spark=spark, dbutils=dbutils)
+            
+            if not schema_info:
+                raise ValueError(
+                    f"Schema file not found in volume: {self.volume_path}/_schema.json\n"
+                    f"Run test_cdc_matrix.sh to generate schema files."
+                )
+        
+        # AZURE modes: Read from Azure Blob Storage
+        else:
+            # Determine format type
+            if self.mode == ConnectorMode.AZURE_JSON:
+                format_type = 'json'
+            else:
+                format_type = 'parquet'  # AZURE_PARQUET or AZURE_DUAL default to parquet
+            
+            # Load schema metadata from Azure
+            schema_info = self._load_schema_from_azure(table_name, format_type=format_type)
+            
+            if not schema_info:
+                raise ValueError(
+                    f"Schema file not found in Azure for table '{table_name}' ({format_type} format)\n"
+                    f"Run test_cdc_matrix.sh to generate schema files."
+                )
+        
+        primary_keys = schema_info.get('primary_keys', [])
+        
+        if not primary_keys:
+            raise ValueError(
+                f"No primary keys found in schema file for table '{table_name}'\n"
+                f"Ensure the table has a primary key defined."
+            )
+        
+        return {
+            "primary_keys": primary_keys,
+            "cursor_field": "_cdc_updated",
+            "ingestion_type": "cdc"
+        }
+    
     def _get_connection(self, table_options: Dict[str, str] = None):
         """Create and return a new connection to CockroachDB.
         
@@ -351,6 +567,11 @@ class LakeflowConnect:
     
     def get_table_schema(self, table_name: str, table_options: Dict[str, str] = None) -> StructType:
         """Get the Spark schema for a given table."""
+        # In file-based modes (VOLUME or AZURE), infer schema from files instead of querying CockroachDB
+        if self.mode in [ConnectorMode.VOLUME, ConnectorMode.AZURE_PARQUET, ConnectorMode.AZURE_JSON, ConnectorMode.AZURE_DUAL]:
+            return self._get_schema_from_files(table_name)
+        
+        # For DIRECT mode, query CockroachDB
         if table_name not in self.list_tables(table_options):
             raise ValueError(f"Table '{table_name}' not found in schema '{self.schema}'")
         
@@ -474,6 +695,11 @@ class LakeflowConnect:
         self, table_name: str, table_options: Dict[str, str]
     ) -> Dict[str, Any]:
         """Read table metadata."""
+        # In file-based modes (VOLUME or AZURE), read metadata from _schema.json file
+        if self.mode in [ConnectorMode.VOLUME, ConnectorMode.AZURE_PARQUET, ConnectorMode.AZURE_JSON, ConnectorMode.AZURE_DUAL]:
+            return self._get_metadata_from_files(table_name)
+        
+        # For DIRECT mode, query CockroachDB
         if table_name not in self.list_tables(table_options):
             raise ValueError(f"Table '{table_name}' not found in schema '{self.schema}'")
         
@@ -519,9 +745,9 @@ class LakeflowConnect:
         """
         print(f"Reading table: {table_name} (mode={self.mode}, cursor={start_offset.get('cursor') if start_offset else None})")
         
-        if self.mode == "volume":
+        if self.mode == ConnectorMode.VOLUME:
             return self._read_table_from_volume(table_name, start_offset, table_options)
-        elif self.mode == "azure_parquet":
+        elif self.mode == ConnectorMode.AZURE_PARQUET:
             return self._read_table_from_azure_parquet(table_name, start_offset, table_options)
         else:
             return self._read_table_direct(table_name, start_offset, table_options)
@@ -1010,17 +1236,43 @@ class LakeflowConnect:
         spark, dbutils = self._ensure_spark_and_dbutils(spark, dbutils)
         
         file_list = []
+        
+        def list_recursive(path):
+            """Recursively list files in directory and subdirectories."""
+            files = []
+            try:
+                items = dbutils.fs.ls(path)
+                for item in items:
+                    # Skip metadata directories (check path since item.name can be empty)
+                    if '/_metadata/' in item.path:
+                        continue
+                    
+                    # Extract directory/file name from path (handle empty item.name)
+                    item_name = item.name if item.name else item.path.rstrip('/').split('/')[-1]
+                    
+                    # Skip items starting with underscore
+                    if item_name.startswith('_'):
+                        continue
+                    
+                    # Check if it's a file by extension
+                    is_data_file = any(item_name.endswith(ext) for ext in file_extensions)
+                    
+                    if is_data_file:
+                        # Add data file
+                        files.append({
+                            'name': item_name,
+                            'path': item.path,
+                            'size': item.size
+                        })
+                    else:
+                        # Assume it's a directory, recurse into it
+                        files.extend(list_recursive(item.path))
+            except Exception:
+                pass  # Directory might not exist or be accessible
+            return files
+        
         try:
-            # Use dbutils to list files (REQUIRED)
-            files = dbutils.fs.ls(effective_path)
-            for file_info in files:
-                # Check if file matches any of the desired extensions
-                if any(file_info.name.endswith(ext) for ext in file_extensions):
-                    file_list.append({
-                        'name': file_info.name,
-                        'path': file_info.path,
-                        'size': file_info.size
-                    })
+            file_list = list_recursive(effective_path)
             return file_list
             
         except Exception as e:
@@ -1034,23 +1286,29 @@ class LakeflowConnect:
         """
         Read table data from Databricks Unity Catalog Volume.
         
+        Supports both JSON and Parquet changefeed formats:
+        - JSON (.ndjson, .json): Wrapped envelope format (before/after/key)
+        - Parquet (.parquet): Native CockroachDB format (__crdb__event_type)
+        
         Flow:
-        1. List Parquet files in Volume (using dbutils or Spark)
+        1. List JSON/Parquet files in Volume (using dbutils)
         2. Filter files by cursor (filename-based, has embedded timestamp)
-        3. Read each Parquet file using Spark
-        4. Transform CDC format (extract 'after', add metadata)
-        5. Yield rows to Spark
-        6. Update cursor to latest file processed
+        3. Detect format from file extension
+        4. Read each file using appropriate Spark reader (json or parquet)
+        5. Transform CDC format (add metadata, classify operations)
+        6. Yield rows to caller
+        7. Update cursor to latest file processed
         
         Cursor Strategy:
-        - Parquet filenames contain timestamp prefix (e.g., 202512191714242809831900000000000-...)
+        - Filenames contain timestamp prefix (e.g., 202512191714242809831900000000000-...)
         - Sort files by name (timestamp order)
         - Track last processed filename as cursor
         - Process only files > cursor
+        - Mixed JSON/Parquet files are processed in timestamp order
         
         Snapshot vs CDC:
-        - All events treated uniformly (no explicit snapshot/CDC distinction in Parquet)
-        - Rely on 'updated' timestamp for ordering
+        - Parquet: Uses timestamp comparison against snapshot_cutoff
+        - JSON: Uses before/after presence + optional timestamp comparison
         - Both snapshot and CDC events come through same file stream
         
         Args:
@@ -1063,8 +1321,6 @@ class LakeflowConnect:
         Raises:
             RuntimeError: If spark or dbutils not available
         """
-        import pyarrow.parquet as pq
-        
         # Validate spark and dbutils are available (single source of truth - NO FALLBACKS)
         spark, dbutils = self._ensure_spark_and_dbutils(spark, dbutils)
         
@@ -1075,18 +1331,19 @@ class LakeflowConnect:
         primary_keys = schema_info.get('primary_keys', []) if schema_info else []
         
         # Use shared file listing method (pass spark and dbutils)
+        # This will list both JSON and Parquet files
         file_list = self._list_volume_files(self.volume_path, spark=spark, dbutils=dbutils)
         if not file_list:
             return iter([]), start_offset
         
-        # Filter and sort files by cursor
-        new_files = [f for f in file_list if f['name'] > last_cursor]
+        # Filter out _metadata/ directory contents and apply cursor filter
+        new_files = [f for f in file_list if '/_metadata/' not in f['path'] and f['name'] > last_cursor]
         new_files.sort(key=lambda f: f['name'])
         
         if not new_files:
             return iter([]), start_offset
         
-        # Read and process each Parquet file
+        # Read and process each file (JSON or Parquet)
         all_rows = []
         latest_filename = last_cursor
         
@@ -1095,30 +1352,110 @@ class LakeflowConnect:
             file_path = file_info['path']
             
             try:
-                # Read Parquet using Spark (handles Volume paths natively)
-                df = spark.read.parquet(file_path)
-                
-                # Convert to Pandas for easier row-by-row processing
-                pdf = df.toPandas()
-                records = pdf.to_dict('records')
-                
-                # Process records using common method
-                snapshot_cutoff = self._snapshot_cutoff_timestamps.get(table_name)
-                transformed_records = self._process_parquet_records(
-                    records,
-                    source_file=filename,
-                    primary_key_columns=primary_keys,
-                    fallback_timestamp=None,
-                    snapshot_cutoff=snapshot_cutoff
-                )
+                # Detect format from file extension
+                if filename.endswith('.parquet'):
+                    # Read Parquet using Spark
+                    df = spark.read.parquet(file_path)
+                    
+                    # Convert to Pandas for row-by-row processing
+                    pdf = df.toPandas()
+                    records = pdf.to_dict('records')
+                    
+                    # Process Parquet records
+                    snapshot_cutoff = self._snapshot_cutoff_timestamps.get(table_name)
+                    transformed_records = self._process_parquet_records(
+                        records,
+                        source_file=filename,
+                        primary_key_columns=primary_keys,
+                        fallback_timestamp=None,
+                        snapshot_cutoff=snapshot_cutoff
+                    )
+                    
+                elif filename.endswith(('.ndjson', '.json')):
+                    # Read JSON using Spark
+                    df = spark.read.json(file_path)
+                    
+                    # Convert to Pandas for row-by-row processing
+                    pdf = df.toPandas()
+                    records = pdf.to_dict('records')
+                    
+                    # Process JSON envelope records
+                    snapshot_cutoff = self._snapshot_cutoff_timestamps.get(table_name)
+                    transformed_records = self._process_json_records(
+                        records,
+                        source_file=filename,
+                        primary_key_columns=primary_keys,
+                        fallback_timestamp=None,
+                        snapshot_cutoff=snapshot_cutoff
+                    )
+                    
+                else:
+                    # Skip unknown file formats
+                    continue
                 
                 all_rows.extend(transformed_records)
                 
-            except Exception:
+            except Exception as e:
+                # Log error and continue to next file
+                print(f"⚠️  Error processing {filename}: {e}")
                 continue
             
             # Update cursor to this file
             latest_filename = filename
+        
+        # ====================================================================
+        # Apply CDC deduplication (keep latest state per key, like Autoloader)
+        # ====================================================================
+        if all_rows and primary_keys:
+            try:
+                # Convert to pandas DataFrame for merge/dedup operations
+                import pandas as pd
+                pdf = pd.DataFrame(all_rows)
+                
+                # Convert to Spark for proper merge handling
+                df_raw = spark.createDataFrame(pdf)
+                
+                # Merge column family fragments (if table uses split column families)
+                df_merged = merge_column_family_fragments(
+                    df_raw,
+                    primary_key_columns=primary_keys,
+                    debug=False  # Set to True for debugging
+                )
+                
+                # Deduplicate: Keep only LATEST state per primary key
+                # This matches Autoloader's behavior in load_and_merge_cdc_to_delta
+                from pyspark.sql import Window
+                from pyspark.sql.functions import row_number, col
+                
+                # Determine which timestamp column to use
+                timestamp_col = None
+                if '_cdc_timestamp' in df_merged.columns:
+                    timestamp_col = '_cdc_timestamp'
+                elif '_cdc_updated' in df_merged.columns:
+                    timestamp_col = '_cdc_updated'
+                elif '__crdb__updated' in df_merged.columns:
+                    timestamp_col = '__crdb__updated'
+                elif 'updated' in df_merged.columns:
+                    timestamp_col = 'updated'
+                
+                if timestamp_col:
+                    # Deduplicate by PK only, keeping latest by timestamp
+                    window_spec = Window.partitionBy(*primary_keys).orderBy(col(timestamp_col).desc())
+                    df_deduped = df_merged.withColumn("_row_num", row_number().over(window_spec)) \
+                                          .filter("_row_num == 1") \
+                                          .drop("_row_num")
+                    
+                    # Filter out DELETE operations (Autoloader does this via left_anti join)
+                    # DELETEs are applied by removing those keys, not by keeping DELETE rows
+                    df_final = df_deduped.filter("_cdc_operation != 'DELETE'")
+                    
+                    # Convert back to list of dicts
+                    pdf_final = df_final.toPandas()
+                    all_rows = pdf_final.to_dict('records')
+            except Exception as e:
+                # If deduplication fails, return raw data (better than failing completely)
+                print(f"⚠️  Deduplication failed: {e}")
+                print(f"   Returning raw data without deduplication")
         
         # Return data + updated offset
         end_offset = {"cursor": latest_filename}
@@ -1497,6 +1834,98 @@ class LakeflowConnect:
                     '_cdc_operation': cdc_operation,
                     '_source_file': source_file
                 }
+            
+            transformed_records.append(transformed)
+        
+        return transformed_records
+    
+    def _process_json_records(
+        self,
+        records: List[Dict[str, Any]],
+        source_file: str,
+        primary_key_columns: List[str] = None,
+        fallback_timestamp: str = None,
+        snapshot_cutoff: str = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process JSON envelope records and transform to CDC format.
+        
+        Handles CockroachDB JSON changefeed format:
+        - 'after' only = snapshot or insert
+        - 'after' + 'before' = update
+        - 'before' only = delete
+        - 'key' array contains primary key values
+        
+        Args:
+            records: List of records from JSON file
+            source_file: Source filename for tracking
+            primary_key_columns: Optional list of primary key column names
+            fallback_timestamp: Fallback timestamp if not in record
+            snapshot_cutoff: Optional cutoff timestamp to distinguish snapshots from updates
+                           Events with timestamp > cutoff are considered UPDATEs/INSERTs
+        
+        Returns:
+            List of transformed records with CDC metadata
+        """
+        transformed_records = []
+        
+        for record in records:
+            after_data = record.get('after', {})
+            before_data = record.get('before', {})
+            key_array = record.get('key', [])
+            updated_timestamp = record.get('updated', fallback_timestamp)
+            
+            # Determine operation based on before/after presence
+            has_after = after_data is not None and (not isinstance(after_data, dict) or len(after_data) > 0)
+            has_before = before_data is not None and (not isinstance(before_data, dict) or len(before_data) > 0)
+            
+            # Classify operation
+            if has_after and not has_before:
+                # Only 'after' present - could be SNAPSHOT or INSERT
+                if snapshot_cutoff and updated_timestamp:
+                    # Use timestamp to distinguish
+                    if updated_timestamp <= snapshot_cutoff:
+                        cdc_operation = 'SNAPSHOT'
+                    else:
+                        cdc_operation = 'INSERT'
+                else:
+                    # No cutoff - treat as SNAPSHOT (conservative)
+                    cdc_operation = 'SNAPSHOT'
+                row_data = after_data if isinstance(after_data, dict) else {}
+                
+            elif has_after and has_before:
+                cdc_operation = 'UPDATE'
+                row_data = after_data if isinstance(after_data, dict) else {}
+                
+            elif has_before and not has_after:
+                cdc_operation = 'DELETE'
+                row_data = before_data if isinstance(before_data, dict) else {}
+                
+            else:
+                cdc_operation = 'UNKNOWN'
+                row_data = {}
+            
+            # Extract primary key values from 'key' array
+            cdc_key_pairs = []
+            if primary_key_columns and key_array:
+                for i, pk_col in enumerate(primary_key_columns):
+                    if i < len(key_array):
+                        cdc_key_pairs.append((pk_col, key_array[i]))
+            
+            # Build transformed record with data columns + metadata
+            transformed = {
+                **row_data,  # Data columns from 'after' or 'before'
+                '_cdc_key': cdc_key_pairs,  # List of (col, val) tuples
+                '_cdc_updated': updated_timestamp,
+                '_cdc_operation': cdc_operation,
+                '_source_file': source_file
+            }
+            
+            # Also add primary key values as top-level columns for easier access
+            if primary_key_columns and key_array:
+                for i, pk_col in enumerate(primary_key_columns):
+                    if i < len(key_array) and pk_col not in transformed:
+                        transformed[pk_col] = key_array[i]
             
             transformed_records.append(transformed)
         
@@ -2441,6 +2870,14 @@ WITH
             if '.RESOLVED' in blob.name:
                 continue
             
+            # Skip metadata directories and files (e.g., _metadata/schema.json, _schema.json, _SUCCESS, etc.)
+            if '/_metadata/' in blob.name:
+                continue
+            
+            blob_name_only = blob.name.split('/')[-1]
+            if blob_name_only.startswith('_'):
+                continue
+            
             # Filter by table name if provided (table name is embedded in filename)
             # Example filename: 202512222012135254607470000000000-...-usertable-...
             if table_name and table_name not in blob.name:
@@ -2574,7 +3011,7 @@ WITH
         """
         Store schema file in Azure Blob Storage alongside data files.
         
-        Schema is stored as: {format}/{catalog}/{schema}/{table}/_schema.json
+        Schema is stored as: {format}/{catalog}/{schema}/{table}/_metadata/schema.json
         
         Args:
             table_name: Name of the table
@@ -2595,8 +3032,8 @@ WITH
         else:
             path_prefix = self.json_path_prefix
         
-        # Store schema at: format/catalog/schema/table/_schema.json
-        schema_blob_name = f"{path_prefix}/{table_name}/_schema.json"
+        # Store schema at: format/catalog/schema/table/_metadata/schema.json
+        schema_blob_name = f"{path_prefix}/{table_name}/_metadata/schema.json"
         
         blob_client = blob_service_client.get_blob_client(
             container=self.azure_container,
@@ -2635,8 +3072,8 @@ WITH
             else:
                 path_prefix = self.json_path_prefix
             
-            # Load schema from: format/catalog/schema/table/_schema.json
-            schema_blob_name = f"{path_prefix}/{table_name}/_schema.json"
+            # Load schema from: format/catalog/schema/table/_metadata/schema.json
+            schema_blob_name = f"{path_prefix}/{table_name}/_metadata/schema.json"
             
             blob_client = blob_service_client.get_blob_client(
                 container=self.azure_container,
@@ -2675,8 +3112,8 @@ WITH
             # Validate spark and dbutils are available (single source of truth - NO FALLBACKS)
             spark, dbutils = self._ensure_spark_and_dbutils(spark, dbutils)
             
-            # Load schema from: volume_path/_schema.json
-            schema_file_path = f"{volume_path}/_schema.json"
+            # Load schema from: volume_path/_metadata/schema.json
+            schema_file_path = f"{volume_path}/_metadata/schema.json"
             
             try:
                 # Read file (max 1MB)
@@ -3122,7 +3559,8 @@ def create_connector(
     }
     
     # Support multiple credential formats
-    if 'token' in crdb_config and 'base_url' in crdb_config:
+    # Check for non-empty values, not just presence of keys
+    if crdb_config.get('token') and crdb_config.get('base_url'):
         # GitHub-style format
         options['token'] = crdb_config['token']
         options['base_url'] = crdb_config['base_url']
@@ -3236,11 +3674,18 @@ def analyze_azure_changefeed_files(
     else:
         file_extension = '.ndjson'
     
-    # Collect all data files (exclude .RESOLVED files)
+    # Collect all data files (exclude .RESOLVED files, metadata files, and _metadata/ directory)
     data_blobs = []
     blob_list = container_client.list_blobs(name_starts_with=path_prefix)
     for blob in blob_list:
-        if file_extension in blob.name and not blob.name.endswith('.RESOLVED'):
+        # Skip metadata directory contents
+        if '/_metadata/' in blob.name:
+            continue
+            
+        blob_name = blob.name.split('/')[-1]  # Get just the filename
+        if (file_extension in blob.name and 
+            not blob.name.endswith('.RESOLVED') and 
+            not blob_name.startswith('_')):
             data_blobs.append(blob.name)
     
     if not data_blobs:
@@ -3779,6 +4224,8 @@ def analyze_volume_changefeed_files(
     spark, dbutils = temp_connector._ensure_spark_and_dbutils(spark, dbutils)
     
     # Use shared file listing method
+    # Note: We list ALL files (including _metadata/) for accurate reporting
+    # Filtering happens during processing (skip non-data files)
     file_list = temp_connector._list_volume_files(volume_path, spark=spark, dbutils=dbutils)
     
     if debug:
@@ -3879,6 +4326,12 @@ def analyze_volume_changefeed_files(
         try:
             file_path = file_info['path']
             file_name = file_info['name']
+            
+            # Skip metadata files and _metadata/ directory contents
+            if file_name.startswith('_') or '/_metadata/' in file_path:
+                if debug:
+                    print(f"   ⏭️  Skipping metadata file: {file_name}")
+                continue
             
             # Detect file format
             is_json = file_name.endswith(('.ndjson', '.json'))
@@ -3998,8 +4451,9 @@ def analyze_volume_changefeed_files(
                 all_events.append(event)
             
         except Exception as e:
-            if debug:
-                print(f"Error processing {file_info['name']}: {e}")
+            # Only print errors for actual data files (not metadata files starting with _)
+            if debug and not file_info['name'].startswith('_'):
+                print(f"   ⚠️  Error processing {file_info['name']}: {e}")
             continue
     
     if debug:
@@ -4869,7 +5323,9 @@ def get_timestamped_path(
     
     try:
         # List timestamped subdirectories
-        items = dbutils.fs.ls(full_prefix)
+        # Add trailing slash to ensure we're listing the directory contents
+        prefix_to_list = full_prefix if full_prefix.endswith('/') else f"{full_prefix}/"
+        items = dbutils.fs.ls(prefix_to_list)
     except Exception as e:
         raise ValueError(
             f"Path prefix not found: {full_prefix}\n"
@@ -4882,37 +5338,50 @@ def get_timestamped_path(
     # Filter for timestamp directories (numeric names)
     timestamp_dirs = []
     debug_items = []
+    
     for item in items:
-        # Extract name first to check if it's a potential timestamp
-        dir_name = item.name.rstrip('/')
+        # Extract name from path or name attribute
+        # item.name can be empty or just '/' for some implementations
+        # Fallback to extracting from path if name is empty
+        dir_name = item.name.rstrip('/') if item.name else ''
         
-        # Debug: Track all items for diagnostics
-        debug_items.append({
-            'name': dir_name,
-            'path': item.path,
-            'is_numeric': dir_name.isdigit(),
-            'length': len(dir_name)
-        })
+        # If name is empty, extract from path
+        if not dir_name:
+            # Extract last component from path
+            # Example: '/Volumes/.../test-scenario/1769022634/' -> '1769022634'
+            path_parts = item.path.rstrip('/').split('/')
+            dir_name = path_parts[-1] if path_parts else ''
+        
+        # Debug: Track all items for diagnostics (but limit to first 20 for readability)
+        if len(debug_items) < 20:
+            debug_items.append({
+                'name': dir_name,
+                'path': item.path,
+                'is_numeric': dir_name.isdigit(),
+                'length': len(dir_name)
+            })
         
         # Quick filter: Only process items with numeric names (10 digits = timestamp)
         if not (dir_name.isdigit() and len(dir_name) == 10):
             continue
         
         # Check if directory (handle different FileInfo implementations)
+        # Priority order: isDir() method > path ends with '/' > try to list it
         is_dir = False
         try:
             # Try calling/accessing isDir
             is_dir = item.isDir() if callable(item.isDir) else item.isDir
         except (AttributeError, TypeError):
-            # Fallback: Check if path ends with '/' or try to list it
+            # Fallback 1: Check if path ends with '/'
             if item.path.endswith('/'):
                 is_dir = True
             else:
-                # Last resort: Try to list it (will fail if it's a file)
+                # Fallback 2: Try to list it (will fail if it's a file)
                 try:
                     dbutils.fs.ls(item.path)
                     is_dir = True
                 except:
+                    # It's a file, not a directory
                     is_dir = False
         
         if is_dir:
@@ -4923,42 +5392,30 @@ def get_timestamped_path(
             })
     
     if not timestamp_dirs:
-        # Try to check if timestamp directory exists directly
-        # (Sometimes dbutils.fs.ls doesn't show all directories)
-        potential_timestamps = [1767823340, 1767823100, 1767822800, 1767820000, 1767810000]
-        found_via_direct_check = None
-        for ts in potential_timestamps:
-            test_path = f"{full_prefix}/{ts}"
-            try:
-                dbutils.fs.ls(test_path)
-                # If ls succeeds, directory exists
-                found_via_direct_check = test_path
-                print(f"⚠️  Found timestamp directory via direct check: {test_path}")
-                print(f"    (Directory was NOT returned by ls of parent directory)")
-                timestamp_dirs.append({
-                    'name': str(ts),
-                    'path': test_path,
-                    'timestamp': ts
-                })
-                break
-            except:
-                pass
+        # No timestamp directories found - provide detailed diagnostics
+        debug_info = "\n".join([f"  - {item['name']}: is_numeric={item['is_numeric']}, length={item['length']}, path={item['path']}" 
+                                for item in debug_items])  # Show all debug items
         
-        if not timestamp_dirs:
-            # Add diagnostic info about what was found
-            debug_info = "\n".join([f"  - {item['name']}: is_numeric={item['is_numeric']}, length={item['length']}" 
-                                    for item in debug_items[:20]])  # Show first 20 items
-            raise ValueError(
-                f"No timestamped directories found in: {full_prefix}\n\n"
-                f"Expected directory structure:\n"
-                f"  {full_prefix}/\n"
-                f"  ├── 1767823340/  (timestamp directories)\n"
-                f"  ├── 1767823100/\n"
-                f"  └── 1767822800/\n\n"
-                f"Found {len(debug_items)} items in directory:\n{debug_info}\n\n"
-                f"Tried direct checks for common timestamps: {potential_timestamps}\n\n"
-                f"Run test_cdc_matrix.sh to generate test data with timestamps."
-            )
+        raise ValueError(
+            f"No timestamped directories found in: {full_prefix}\n\n"
+            f"Expected directory structure:\n"
+            f"  {full_prefix}/\n"
+            f"  ├── 1769022634/  (10-digit Unix timestamp directories)\n"
+            f"  ├── 1769022500/\n"
+            f"  └── 1769022000/\n\n"
+            f"Found {len(debug_items)} items in parent directory:\n{debug_info}\n\n"
+            f"Possible causes:\n"
+            f"  1. Test data not yet synced - run: test_cdc_matrix.sh\n"
+            f"  2. Wrong path format - check path_prefix parameter\n"
+            f"  3. Items have empty names - code now extracts from path (should be fixed)\n"
+            f"  4. Items not recognized as directories by dbutils.fs.ls()\n\n"
+            f"To debug further, try in notebook:\n"
+            f"  items = dbutils.fs.ls('{prefix_to_list}')\n"
+            f"  print(f'Total items: {{len(items)}}')\n"
+            f"  for item in items[:10]:\n"
+            f"      name = item.name.rstrip('/') if item.name else item.path.rstrip('/').split('/')[-1]\n"
+            f"      print(f'  name={{name!r}}, isDir={{item.isDir()}}, path={{item.path}}')\n"
+        )
     
     # Sort by timestamp (newest first)
     timestamp_dirs.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -5077,7 +5534,7 @@ def merge_column_family_fragments(
     if metadata_columns is None:
         metadata_columns = [
             '__crdb__event_type', '__crdb__updated', '_rescued_data',
-            '_cdc_operation', '_cdc_timestamp', '_source_file', '_processing_time',
+            '_cdc_operation', '_cdc_timestamp', '_cdc_updated', '_source_file', '_processing_time',
             '_metadata',  # Unity Catalog metadata
             # JSON envelope columns (should not be merged as data columns)
             'after', 'before', 'key', 'updated',
@@ -5123,6 +5580,8 @@ def merge_column_family_fragments(
             timestamp_col_for_check = None
             if '_cdc_timestamp' in all_columns:
                 timestamp_col_for_check = '_cdc_timestamp'
+            elif '_cdc_updated' in all_columns:
+                timestamp_col_for_check = '_cdc_updated'
             elif '__crdb__updated' in all_columns:
                 timestamp_col_for_check = '__crdb__updated'
             elif 'updated' in all_columns:
@@ -5191,6 +5650,8 @@ def merge_column_family_fragments(
     timestamp_col = None
     if '_cdc_timestamp' in all_columns:
         timestamp_col = '_cdc_timestamp'
+    elif '_cdc_updated' in all_columns:
+        timestamp_col = '_cdc_updated'
     elif '__crdb__updated' in all_columns:
         timestamp_col = '__crdb__updated'
     elif 'updated' in all_columns:
@@ -5477,6 +5938,19 @@ def load_and_merge_cdc_to_delta(
     effective_schema = schema
     effective_table = source_table
     
+    # For CockroachDB fallback: Extract test table name from path_prefix if it looks like test data
+    # Example path_prefix: "json/defaultdb/public/test-json_usertable_with_split"
+    # Scenario name: "test-json_usertable_with_split" → test table: "test_json_usertable_with_split"
+    test_table_name = None
+    if components.path_prefix:
+        prefix_parts = components.path_prefix.rstrip('/').split('/')
+        scenario_part = prefix_parts[-1]  # Last component is the scenario
+        if scenario_part.startswith('test-'):
+            # Convert scenario format to table format: "test-json_table_split" → "test_json_table_split"
+            test_table_name = scenario_part.replace('test-', 'test_', 1).replace('-', '_')
+            if debug:
+                print(f"🔍 Detected test table name from path: {test_table_name}")
+    
     if debug:
         print("=" * 80)
         print("AUTOMATED CDC TESTING")
@@ -5553,9 +6027,35 @@ def load_and_merge_cdc_to_delta(
         print(f"   File extension: {file_extension}")
     
     try:
-        # List files in volume path
-        all_files = dbutils.fs.ls(volume_path)
-        data_files = [f for f in all_files if f.name.endswith(file_extension) and not f.name.startswith('_')]
+        # List files in volume path (recursively to handle date subdirectories)
+        def list_data_files_recursive(path):
+            """Recursively list data files, skipping metadata."""
+            files = []
+            try:
+                items = dbutils.fs.ls(path)
+                for item in items:
+                    # Skip metadata directories (check path since item.name can be empty)
+                    if '/_metadata/' in item.path:
+                        continue
+                    
+                    # Extract directory/file name from path (handle empty item.name)
+                    item_name = item.name if item.name else item.path.rstrip('/').split('/')[-1]
+                    
+                    # Skip items starting with underscore
+                    if item_name.startswith('_'):
+                        continue
+                    
+                    # Check if it's a data file
+                    if item_name.endswith(file_extension):
+                        files.append(item)
+                    else:
+                        # Assume it's a directory, recurse into it
+                        files.extend(list_data_files_recursive(item.path))
+            except Exception:
+                pass  # Directory might not exist or be accessible
+            return files
+        
+        data_files = list_data_files_recursive(volume_path)
         
         if len(data_files) == 0:
             error_msg = f"""
@@ -5686,12 +6186,19 @@ def load_and_merge_cdc_to_delta(
             # Create connector
             connector = create_connector(crdb_config, effective_catalog, effective_schema)
             
+            # For test data, try the test table name first (e.g., test_json_usertable_with_split)
+            # Otherwise, fall back to the base table name (e.g., usertable)
+            query_table = test_table_name if test_table_name else effective_table
+            
+            if debug and test_table_name:
+                print(f"   Querying test table: {query_table}")
+            
             # Get primary keys
-            metadata = connector.read_table_metadata(effective_table, {})
+            metadata = connector.read_table_metadata(query_table, {})
             primary_keys = metadata.get('primary_keys', [])
             
             # Check for column families
-            has_column_families = connector._has_multiple_column_families(effective_table, {})
+            has_column_families = connector._has_multiple_column_families(query_table, {})
             
             if debug:
                 print(f"   ✅ Got metadata from CockroachDB")
@@ -5701,7 +6208,23 @@ def load_and_merge_cdc_to_delta(
         except Exception as e:
             if debug:
                 print(f"   ⚠️  CockroachDB query failed: {e}")
-                print()
+                # If test table query failed and we have a test table name, try base table as fallback
+                if test_table_name:
+                    try:
+                        print(f"   🔄 Retrying with base table: {effective_table}")
+                        metadata = connector.read_table_metadata(effective_table, {})
+                        primary_keys = metadata.get('primary_keys', [])
+                        has_column_families = connector._has_multiple_column_families(effective_table, {})
+                        
+                        print(f"   ✅ Got metadata from CockroachDB (base table)")
+                        print(f"   Primary keys: {primary_keys}")
+                        print(f"   Has column families: {has_column_families}")
+                        print()
+                    except Exception as e2:
+                        print(f"   ⚠️  Base table query also failed: {e2}")
+                        print()
+                else:
+                    print()
     
     # Error if still no primary keys
     if not primary_keys:
@@ -5769,6 +6292,7 @@ def load_and_merge_cdc_to_delta(
         .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema")
         .option("cloudFiles.inferColumnTypes", "true")
         .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+        .option("recursiveFileLookup", "true")  # Read files in subdirectories (e.g., date dirs)
         .option("pathGlobFilter", f"*{effective_table}*{file_extension}")
         .load(volume_path)
     )
@@ -6127,7 +6651,8 @@ def load_and_merge_cdc_to_delta(
         'match': match,
         'query': query,
         'destination_table': target_table_path,
-        'checkpoint_path': checkpoint_path  # Added for cleanup
+        'checkpoint_path': checkpoint_path,  # Added for cleanup
+        'resolved_volume_path': volume_path  # Show actual path used (after timestamp resolution)
     }
 
 
@@ -6305,4 +6830,157 @@ def cleanup_test_checkpoint(
         'success': True,
         'items_deleted': items_deleted,
         'table_dropped': table_dropped
+    }
+
+
+def collect_all_records(
+    connector: 'LakeflowConnect',
+    table_name: str,
+    table_options: Dict[str, str] = None,
+    max_batches: int = None,
+    debug: bool = False
+) -> Dict[str, Any]:
+    """
+    Convenience function to read all records from a table using iterator pattern.
+    
+    This wraps the manual while-loop pattern into a single function call.
+    Handles batch iteration, offset management, and statistics collection automatically.
+    
+    **Use Cases:**
+    - Testing and prototyping CDC workflows
+    - Collecting data for analysis or comparison
+    - Batch processing of small to medium datasets
+    
+    **Important:**
+    - All records are loaded into memory - use with caution for large tables
+    - For production streaming, use `load_and_merge_cdc_to_delta()` instead
+    - Connector automatically applies deduplication and DELETE filtering
+    
+    Args:
+        connector: LakeflowConnect instance (any mode: VOLUME, AZURE_*, DIRECT)
+        table_name: Name of table to read
+        table_options: Optional table-specific options (default: {})
+        max_batches: Safety limit for number of batches (None = unlimited, recommended for DIRECT mode)
+        debug: Print progress messages during iteration
+        
+    Returns:
+        Dictionary with:
+            - records: List[Dict] - All records (deduplicated, DELETEs filtered)
+            - batch_count: int - Number of batches read
+            - operations: Dict[str, int] - Count of each CDC operation type
+            - primary_keys: List[str] - Primary key columns
+            - metadata: Dict - Full table metadata
+            
+    Example:
+        ```python
+        from cockroachdb import LakeflowConnect, ConnectorMode, collect_all_records
+        
+        # Initialize connector
+        connector = LakeflowConnect({
+            'mode': ConnectorMode.VOLUME.value,
+            'volume_path': '/Volumes/main/schema/volume/path/1234567890',
+            'spark': spark,
+            'dbutils': dbutils
+        })
+        
+        # Collect all records
+        result = collect_all_records(
+            connector=connector,
+            table_name='usertable',
+            max_batches=100,  # Safety limit for DIRECT mode
+            debug=True
+        )
+        
+        print(f"Read {len(result['records']):,} records")
+        print(f"Primary keys: {result['primary_keys']}")
+        print(f"CDC operations: {result['operations']}")
+        ```
+        
+    Raises:
+        ValueError: If table not found or invalid configuration
+        RuntimeError: If connector not properly initialized
+    """
+    if table_options is None:
+        table_options = {}
+    
+    # Get metadata (includes primary keys, ingestion type)
+    try:
+        metadata = connector.read_table_metadata(table_name, table_options)
+        primary_keys = metadata.get('primary_keys', [])
+    except Exception as e:
+        raise ValueError(f"Failed to get metadata for table '{table_name}': {e}")
+    
+    if debug:
+        print(f"📖 Reading '{table_name}' using iterator pattern...")
+        print(f"   Mode: {connector.mode}")
+        print(f"   Primary keys: {primary_keys}")
+        print()
+    
+    # Initialize iteration state
+    start_offset = {"cursor": ""}
+    all_records = []
+    batch_count = 0
+    
+    # Read all batches
+    while True:
+        try:
+            record_iterator, end_offset = connector.read_table(
+                table_name=table_name,
+                start_offset=start_offset,
+                table_options=table_options
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to read batch {batch_count + 1}: {e}")
+        
+        # Collect records from this batch
+        batch_records = list(record_iterator)
+        
+        if not batch_records:
+            if debug:
+                print(f"✅ No more records. Finished reading.")
+            break
+        
+        batch_count += 1
+        all_records.extend(batch_records)
+        
+        if debug:
+            cursor_preview = str(end_offset.get('cursor', 'N/A'))[:20]
+            print(f"   Batch {batch_count}: {len(batch_records):,} records (cursor: {cursor_preview}...)")
+        
+        # Check if done (cursor didn't advance)
+        if end_offset.get('cursor') == start_offset.get('cursor'):
+            if debug:
+                print(f"✅ Cursor unchanged. Finished reading.")
+            break
+        
+        # Update offset for next iteration
+        start_offset = end_offset
+        
+        # Safety limit check (especially important for DIRECT mode to prevent infinite loops)
+        if max_batches and batch_count >= max_batches:
+            if debug:
+                print(f"⚠️  Safety limit reached ({max_batches} batches). Stopping.")
+            break
+    
+    # Collect CDC operation statistics
+    operations = {}
+    for record in all_records:
+        op = record.get('_cdc_operation', 'UNKNOWN')
+        operations[op] = operations.get(op, 0) + 1
+    
+    if debug:
+        print(f"\n📊 Summary:")
+        print(f"   Total records: {len(all_records):,}")
+        print(f"   Total batches: {batch_count}")
+        print(f"   CDC Operations:")
+        for op, count in sorted(operations.items()):
+            print(f"      {op}: {count:,}")
+        print()
+    
+    return {
+        'records': all_records,
+        'batch_count': batch_count,
+        'operations': operations,
+        'primary_keys': primary_keys,
+        'metadata': metadata
     }

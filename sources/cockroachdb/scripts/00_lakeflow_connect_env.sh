@@ -189,7 +189,7 @@ AZ() {
     PWMASK="${PWMASK//$DBA_PASSWORD/\$DBA_PASSWORD}"
     PWMASK="${PWMASK//$USER_PASSWORD/\$USER_PASSWORD}"
     PWMASK="${PWMASK//$az_tenantDefaultDomain/\$az_tenantDefaultDomain}"
-    PWMASK="${PWMASK//$az_id/\$az_id}"
+    #PWMASK="${PWMASK//$az_id/\$az_id}"
     PWMASK="${PWMASK//$az_user_name/\$az_user_name}"
     echo -n az "${PWMASK}"
     az "$@" >${DB_STDOUT} 2>${DB_STDERR}
@@ -356,6 +356,7 @@ DBX() {
     local DB_STDOUT=${DB_STDOUT:-"/tmp/dbx_stdout${DB_OUT_SUFFIX:+_${DB_OUT_SUFFIX}}.$$"}
     local DB_STDERR=${DB_STDERR:-"/tmp/dbx_stderr${DB_OUT_SUFFIX:+_${DB_OUT_SUFFIX}}.$$"}
     local RC
+    local DATABRICKS_CONFIG_PROFILE=${DATABRICKS_CONFIG_PROFILE:-DEFAULT}
 
     PWMASK="$@"
     PWMASK="${PWMASK//$DBA_PASSWORD/\$DBA_PASSWORD}"

@@ -213,11 +213,13 @@ echo "════════════════════════�
 echo "Step 3: Check Existing Files in Volume"
 echo "═══════════════════════════════════════════════════════════════"
 
-echo "📂 Checking volume: dbfs:/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}"
+echo "📂 Checking volume: /Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}"
 echo ""
 
 # List files in Volume
-EXISTING_FILES=$(databricks fs ls "dbfs:/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}/" 2>/dev/null | grep '\.parquet$' | awk '{print $NF}' || echo "")
+# Note: 'databricks fs ls' does NOT work with Unity Catalog Volumes - use SDK instead
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXISTING_FILES=$(python3 "$SCRIPTS_DIR/list_volume_files.py" --pattern "*.parquet" "/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}/" 2>/dev/null | awk -F'/' '{print $NF}' || echo "")
 
 if [ -z "$EXISTING_FILES" ]; then
     echo "  (Volume is empty or doesn't exist yet)"
@@ -311,9 +313,10 @@ echo "════════════════════════�
 echo ""
 
 echo "📂 Listing files in Volume:"
-databricks fs ls "dbfs:/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}/" | grep '\.parquet$' | head -10
+# Note: 'databricks fs ls' does NOT work with Unity Catalog Volumes - use SDK instead
+python3 "$SCRIPTS_DIR/list_volume_files.py" --pattern "*.parquet" "/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}/" 2>/dev/null | head -10
 
-FINAL_COUNT=$(databricks fs ls "dbfs:/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}/" | grep -c '\.parquet$' || echo "0")
+FINAL_COUNT=$(python3 "$SCRIPTS_DIR/list_volume_files.py" --count --pattern "*.parquet" "/Volumes/${pipeline_config[catalog]}/${pipeline_config[schema]}/${pipeline_config[volume_name]}/" 2>/dev/null || echo "0")
 echo ""
 echo "✅ Volume contains ${FINAL_COUNT} Parquet files"
 echo ""
