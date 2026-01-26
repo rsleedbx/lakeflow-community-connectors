@@ -488,47 +488,73 @@ For lower-volume workloads, use Databricks Jobs to run the notebook on a schedul
    - **Pipeline Mode**: Triggered or Continuous
    - **Storage Location**: Unity Catalog path (e.g., `main.default.usertable`)
 
-3. Create a notebook with the following SQL:
+3. Create a Python notebook with the following code:
 
-```sql
--- Read streaming data from Azure Blob Storage
-CREATE OR REFRESH STREAMING MATERIALIZED VIEW usertable_raw
-AS SELECT 
-  *,
-  CASE 
-    WHEN __crdb__event_type = 'd' THEN 'DELETE'
-    ELSE 'UPSERT'
-  END AS _cdc_operation,
-  __crdb__updated AS _cdc_updated
-FROM cloud_files(
-  "wasbs://changefeed-events@{your-storage-account}.blob.core.windows.net/parquet/defaultdb/public/usertable/",
-  "parquet",
-  map(
-    "cloudFiles.inferColumnTypes", "true",
-    "cloudFiles.schemaLocation", "/checkpoints/usertable/schema"
-  )
-);
+```python
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+storage_account_name = "your-storage-account-name"  # ← Replace
+container_name = "changefeed-events"                 # ← Replace
+target_catalog = "main"                              # ← Replace
+target_schema = "default"                            # ← Replace
 
--- Deduplicate and apply CDC operations
-CREATE OR REFRESH MATERIALIZED VIEW usertable_deduped
-AS SELECT * FROM (
-  SELECT *,
-    ROW_NUMBER() OVER (
-      PARTITION BY ycsb_key 
-      ORDER BY _cdc_updated DESC
-    ) AS row_num
-  FROM usertable_raw
+# Configure Azure storage access
+spark.conf.set(
+    f"fs.azure.account.key.{storage_account_name}.blob.core.windows.net",
+    "your-storage-account-key"  # ← Replace
 )
-WHERE row_num = 1 
-  AND _cdc_operation != 'DELETE';
 
--- Final target table with MERGE logic
-APPLY CHANGES INTO usertable
-FROM usertable_deduped
-KEYS (ycsb_key)
-SEQUENCE BY _cdc_updated
-COLUMNS * EXCEPT (_cdc_operation, _cdc_updated, __crdb__event_type, __crdb__updated, row_num)
-STORED AS SCD TYPE 1;
+# ============================================================================
+# Read streaming data from Azure Blob Storage
+# ============================================================================
+spark.sql(f"""
+  CREATE OR REFRESH STREAMING MATERIALIZED VIEW {target_catalog}.{target_schema}.usertable_raw
+  AS SELECT 
+    *,
+    CASE 
+      WHEN __crdb__event_type = 'd' THEN 'DELETE'
+      ELSE 'UPSERT'
+    END AS _cdc_operation,
+    __crdb__updated AS _cdc_updated
+  FROM cloud_files(
+    "wasbs://{container_name}@{storage_account_name}.blob.core.windows.net/parquet/defaultdb/public/usertable/",
+    "parquet",
+    map(
+      "cloudFiles.inferColumnTypes", "true",
+      "cloudFiles.schemaLocation", "/checkpoints/usertable/schema"
+    )
+  )
+""")
+
+# ============================================================================
+# Deduplicate and apply CDC operations
+# ============================================================================
+spark.sql(f"""
+  CREATE OR REFRESH MATERIALIZED VIEW {target_catalog}.{target_schema}.usertable_deduped
+  AS SELECT * FROM (
+    SELECT *,
+      ROW_NUMBER() OVER (
+        PARTITION BY ycsb_key 
+        ORDER BY _cdc_updated DESC
+      ) AS row_num
+    FROM {target_catalog}.{target_schema}.usertable_raw
+  )
+  WHERE row_num = 1 
+    AND _cdc_operation != 'DELETE'
+""")
+
+# ============================================================================
+# Final target table with MERGE logic
+# ============================================================================
+spark.sql(f"""
+  APPLY CHANGES INTO {target_catalog}.{target_schema}.usertable
+  FROM {target_catalog}.{target_schema}.usertable_deduped
+  KEYS (ycsb_key)
+  SEQUENCE BY _cdc_updated
+  COLUMNS * EXCEPT (_cdc_operation, _cdc_updated, __crdb__event_type, __crdb__updated, row_num)
+  STORED AS SCD TYPE 1
+""")
 ```
 
 4. Attach the notebook to the pipeline and click **Start**
