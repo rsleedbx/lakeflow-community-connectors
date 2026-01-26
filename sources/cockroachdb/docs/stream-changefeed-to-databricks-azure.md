@@ -362,19 +362,13 @@ ORDER BY _cdc_timestamp;
 
 ## Step 11. Adding UPDATE/DELETE Support
 
-The append-only approach works great for audit logs and time-series data. For applications that need the latest state with automatic UPDATE/DELETE handling, you'll need:
+For applications that need the latest state with automatic UPDATE/DELETE handling, you'll need:
 
 1. **Schema file with primary keys** (for MERGE join conditions)
 2. **MERGE logic** (to apply UPDATE/DELETE operations)
 3. **Deduplication** (to handle CockroachDB column family fragmentation)
 
 > 📚 **Reference:** See [Appendix: Full CDC with UPDATE/DELETE](#appendix-full-cdc-with-updatedelete-support) for complete implementation.
-
-**When to use full CDC:**
-- Applications requiring latest state (not history)
-- Need to handle UPDATE operations as updates (not new rows)
-- Need to remove rows on DELETE operations
-- Want Databricks to handle deduplication automatically
 
 ---
 
