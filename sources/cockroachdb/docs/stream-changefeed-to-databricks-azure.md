@@ -255,18 +255,19 @@ We'll start with the simplest approach: append-only ingestion. All CDC events ar
 
 **What this provides:**
 - All CDC events as immutable history
-- Simple implementation
+- Simple SQL implementation
 - No schema file needed
 - Perfect for audit logs, time-series analysis, and learning
 
 > 💡 **Next step:** After completing append-only ingestion, see [Step 11](#step-11-adding-updatedelete-support) to add UPDATE/DELETE support with MERGE logic.
 
-### Create Databricks Notebook
+### Configure Azure Storage Access
 
-1. Create a new Python notebook in Databricks
+1. In Databricks, create a new **SQL notebook** or **Python notebook**
 
-2. Configure Azure storage credentials:
+2. Configure Azure storage credentials (choose one method):
 
+**Option A: Python cell**
 ```python
 # Configure Azure storage access
 storage_account_name = "your-storage-account-name"  # ← Replace
@@ -278,59 +279,41 @@ spark.conf.set(
 )
 ```
 
-3. Add the append-only ingestion code:
-
-```python
-from pyspark.sql import functions as F
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-storage_account_name = "your-storage-account-name"  # ← Replace
-container_name = "changefeed-events"                 # ← Replace
-target_catalog = "main"                              # ← Replace
-target_schema = "default"                            # ← Replace
-
-source_path = f"wasbs://{container_name}@{storage_account_name}.blob.core.windows.net/parquet/defaultdb/public/usertable/"
-checkpoint_path = "/checkpoints/usertable/append_only"
-target_table = f"{target_catalog}.{target_schema}.usertable_cdc_events"
-
-# ============================================================================
-# Read and append all CDC events
-# ============================================================================
-df = (spark.readStream
-    .format("cloudFiles")
-    .option("cloudFiles.format", "parquet")
-    .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema")
-    .option("recursiveFileLookup", "true")
-    .load(source_path)
-    .select(
-        "*",
-        F.when(F.col("__crdb__event_type") == "d", "DELETE")
-         .otherwise("UPSERT")
-         .alias("_cdc_operation"),
-        F.col("__crdb__updated").alias("_cdc_timestamp")
-    )
-)
-
-# Write all CDC events (no deduplication)
-query = (df.writeStream
-    .format("delta")
-    .option("checkpointLocation", f"{checkpoint_path}/data")
-    .trigger(availableNow=True)
-    .toTable(target_table)
-)
-
-print("✅ Streaming query started")
-print("⏳ Processing data...")
-
-query.awaitTermination()
-
-print("\n" + "="*80)
-print("✅ APPEND-ONLY INGESTION COMPLETED")
-print("="*80)
-print(f"📊 Query your data: SELECT * FROM {target_table}")
+**Option B: SQL cell**
+```sql
+-- Configure Azure storage access
+SET fs.azure.account.key.your-storage-account-name.blob.core.windows.net = "your-storage-account-key";
 ```
+
+### Create Streaming Table (SQL)
+
+3. Add a new **SQL cell** with the following code:
+
+```sql
+-- Create append-only CDC events table
+CREATE OR REFRESH STREAMING TABLE main.default.usertable_cdc_events
+AS SELECT 
+  *,
+  CASE 
+    WHEN __crdb__event_type = 'd' THEN 'DELETE'
+    ELSE 'UPSERT'
+  END AS _cdc_operation,
+  __crdb__updated AS _cdc_timestamp
+FROM cloud_files(
+  "wasbs://changefeed-events@your-storage-account-name.blob.core.windows.net/parquet/defaultdb/public/usertable/",
+  "parquet",
+  map(
+    "cloudFiles.schemaLocation", "/checkpoints/usertable/append_only/schema",
+    "recursiveFileLookup", "true"
+  )
+);
+```
+
+4. Run the cell to create the streaming table
+
+**That's it!** Databricks Autoloader will continuously monitor the Azure path and append new CDC events as they arrive.
+
+> 💡 **For Python users:** See [Appendix: Python Version of Append-Only Ingestion](#appendix-python-version-of-append-only-ingestion) for the PySpark equivalent.
 
 ---
 
@@ -895,6 +878,57 @@ Refer to the [Create and Configure Changefeeds](https://www.cockroachlabs.com/do
 - Read about [CockroachDB changefeed best practices](https://www.cockroachlabs.com/docs/stable/changefeed-best-practices)
 - Set up [Unity Catalog External Locations](https://docs.databricks.com/data-governance/unity-catalog/manage-external-locations-and-credentials.html) for production deployments
 - Review [Lakeflow Spark Declarative Pipelines documentation](https://docs.databricks.com/workflows/delta-live-tables/index.html)
+
+---
+
+## Appendix: Python Version of Append-Only Ingestion
+
+This appendix shows the PySpark equivalent of Step 9's SQL approach. Use this if you need custom transformations or business logic beyond what SQL provides.
+
+```python
+from pyspark.sql import functions as F
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+storage_account_name = "your-storage-account-name"  # ← Replace
+container_name = "changefeed-events"                 # ← Replace
+target_catalog = "main"                              # ← Replace
+target_schema = "default"                            # ← Replace
+
+source_path = f"wasbs://{container_name}@{storage_account_name}.blob.core.windows.net/parquet/defaultdb/public/usertable/"
+checkpoint_path = "/checkpoints/usertable/append_only"
+target_table = f"{target_catalog}.{target_schema}.usertable_cdc_events"
+
+# ============================================================================
+# Read and append all CDC events
+# ============================================================================
+df = (spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "parquet")
+    .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema")
+    .option("recursiveFileLookup", "true")
+    .load(source_path)
+    .select(
+        "*",
+        F.when(F.col("__crdb__event_type") == "d", "DELETE")
+         .otherwise("UPSERT")
+         .alias("_cdc_operation"),
+        F.col("__crdb__updated").alias("_cdc_timestamp")
+    )
+)
+
+# Write all CDC events (no deduplication)
+query = (df.writeStream
+    .format("delta")
+    .option("checkpointLocation", f"{checkpoint_path}/data")
+    .trigger(availableNow=True)
+    .toTable(target_table)
+)
+
+query.awaitTermination()
+print(f"✅ Query your data: SELECT * FROM {target_table}")
+```
 
 ---
 
