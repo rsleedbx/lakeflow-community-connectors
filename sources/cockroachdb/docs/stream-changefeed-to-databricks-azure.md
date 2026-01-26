@@ -261,59 +261,56 @@ We'll start with the simplest approach: append-only ingestion. All CDC events ar
 
 > 💡 **Next step:** After completing append-only ingestion, see [Step 11](#step-11-adding-updatedelete-support) to add UPDATE/DELETE support with MERGE logic.
 
-### Configure Azure Storage Access
+### Create Streaming Table
 
-1. In Databricks, create a new **SQL notebook** or **Python notebook**
+1. In Databricks, create a new **Python notebook**
 
-2. Configure Azure storage credentials (choose one method):
+2. Add the following code:
 
-**Option A: Python cell**
 ```python
-# Configure Azure storage access
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 storage_account_name = "your-storage-account-name"  # ← Replace
 storage_account_key = "your-storage-account-key"      # ← Replace
+container_name = "changefeed-events"                 # ← Replace
+target_catalog = "main"                              # ← Replace
+target_schema = "default"                            # ← Replace
 
+# Configure Azure storage access
 spark.conf.set(
     f"fs.azure.account.key.{storage_account_name}.blob.core.windows.net",
     storage_account_key
 )
-```
 
-**Option B: SQL cell**
-```sql
--- Configure Azure storage access
-SET fs.azure.account.key.your-storage-account-name.blob.core.windows.net = "your-storage-account-key";
-```
-
-### Create Streaming Table (SQL)
-
-3. Add a new **SQL cell** with the following code:
-
-```sql
--- Create append-only CDC events table
-CREATE OR REFRESH STREAMING TABLE main.default.usertable_cdc_events
-AS SELECT 
-  *,
-  CASE 
-    WHEN __crdb__event_type = 'd' THEN 'DELETE'
-    ELSE 'UPSERT'
-  END AS _cdc_operation,
-  __crdb__updated AS _cdc_timestamp
-FROM cloud_files(
-  "wasbs://changefeed-events@your-storage-account-name.blob.core.windows.net/parquet/defaultdb/public/usertable/",
-  "parquet",
-  map(
-    "cloudFiles.schemaLocation", "/checkpoints/usertable/append_only/schema",
-    "recursiveFileLookup", "true"
+# ============================================================================
+# Create append-only CDC events table
+# ============================================================================
+spark.sql(f"""
+  CREATE OR REFRESH STREAMING TABLE {target_catalog}.{target_schema}.usertable_cdc_events
+  AS SELECT 
+    *,
+    CASE 
+      WHEN __crdb__event_type = 'd' THEN 'DELETE'
+      ELSE 'UPSERT'
+    END AS _cdc_operation,
+    __crdb__updated AS _cdc_timestamp
+  FROM cloud_files(
+    "wasbs://{container_name}@{storage_account_name}.blob.core.windows.net/parquet/defaultdb/public/usertable/",
+    "parquet",
+    map(
+      "cloudFiles.schemaLocation", "/checkpoints/usertable/append_only/schema",
+      "recursiveFileLookup", "true"
+    )
   )
-);
+""")
 ```
 
-4. Run the cell to create the streaming table
+3. Run the cell to create the streaming table
 
 **That's it!** Databricks Autoloader will continuously monitor the Azure path and append new CDC events as they arrive.
 
-> 💡 **For Python users:** See [Appendix: Python Version of Append-Only Ingestion](#appendix-python-version-of-append-only-ingestion) for the PySpark equivalent.
+> 💡 **For streaming DataFrame API:** See [Appendix: Python Streaming DataFrame Version](#appendix-python-streaming-dataframe-version) for the readStream/writeStream approach.
 
 ---
 
@@ -881,9 +878,9 @@ Refer to the [Create and Configure Changefeeds](https://www.cockroachlabs.com/do
 
 ---
 
-## Appendix: Python Version of Append-Only Ingestion
+## Appendix: Python Streaming DataFrame Version
 
-This appendix shows the PySpark equivalent of Step 9's SQL approach. Use this if you need custom transformations or business logic beyond what SQL provides.
+This appendix shows the streaming DataFrame API version (readStream/writeStream) instead of the SQL table approach. Use this if you need more control over streaming triggers, checkpoint behavior, or complex transformations.
 
 ```python
 from pyspark.sql import functions as F
