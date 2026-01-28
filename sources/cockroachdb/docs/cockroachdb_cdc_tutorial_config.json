@@ -1,0 +1,43 @@
+{
+  "cockroachdb": {
+    "host": "REPLACE_WITH_YOUR_HOST",
+    "port": 26257,
+    "user": "REPLACE_WITH_YOUR_USER",
+    "password": "REPLACE_WITH_YOUR_PASSWORD",
+    "database": "defaultdb"
+  },
+  "cockroachdb_source": {
+    "catalog": "defaultdb",
+    "schema": "public",
+    "table_name": "usertable",
+    "_comment": "Base table name. If auto_suffix_mode_family=true, _{mode}_{column_family_mode} will be appended",
+    "_schema_note": "Default schema is 'public'. This notebook uses YCSB structure (ycsb_key, field0-9)"
+  },
+  "azure_storage": {
+    "account_name": "REPLACE_WITH_YOUR_STORAGE_ACCOUNT",
+    "account_key": "REPLACE_WITH_YOUR_STORAGE_KEY",
+    "container_name": "changefeed-events"
+  },
+  "databricks_target": {
+    "catalog": "main",
+    "schema": "REPLACE_WITH_YOUR_SCHEMA",
+    "table_name": "usertable",
+    "_comment": "Base table name. If auto_suffix_mode_family=true, _{mode}_{column_family_mode} will be appended"
+  },
+  "cdc_config": {
+    "mode": "append_only",
+    "_mode_options": "append_only (SCD Type 2, keeps history) or update_delete (SCD Type 1, latest state)",
+    "column_family_mode": "single_cf",
+    "_column_family_options": "single_cf (no column families) or multi_cf (with split_column_families)",
+    "primary_key_columns": ["ycsb_key"],
+    "auto_suffix_mode_family": true,
+    "_auto_suffix_comment": "If true, automatically append _{mode}_{column_family_mode} to table names if not already present"
+  },
+  "workload_config": {
+    "snapshot_count": 10,
+    "insert_count": 10,
+    "update_count": 9,
+    "delete_count": 8,
+    "_comment": "Net growth per cycle: insert_count - delete_count = 2 rows"
+  }
+}

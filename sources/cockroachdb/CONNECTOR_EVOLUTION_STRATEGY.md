@@ -397,7 +397,19 @@ Test incremental CDC processing:
 sources/cockroachdb/notebooks/test_cdc_scenario.ipynb
 ```
 
-Upload to Databricks and open in a notebook.
+**Upload to Databricks using CLI:**
+
+```bash
+# From the repo root directory
+databricks workspace import \
+  /Users/<your-username>@databricks.com/test_cdc_scenario \
+  --file sources/cockroachdb/notebooks/test_cdc_scenario.ipynb \
+  --language PYTHON \
+  --format JUPYTER \
+  --profile <your-profile>
+```
+
+Replace `<your-username>` with your Databricks username and `<your-profile>` with your CLI profile name.
 
 **6.2 Configure Test Scenario**
 
@@ -1497,13 +1509,36 @@ Azure Blob → $GIT_ROOT/.cache/cdc_test_data/ → Databricks Volume
 ```bash
 $GIT_ROOT/.cache/cdc_test_data/
 ├── json/defaultdb/public/test-json_usertable_no_split/1767823340/
-│   ├── 202601072205313357901250000000000-...-test_json_usertable_no_split-1.ndjson
-│   └── 202601072206035945830580000000001-...-test_json_usertable_no_split-1.ndjson
+│   ├── 202601072205313357901250000000000-928374650001928192-1-72-00000000-test_json_usertable_no_split-1.ndjson
+│   └── 202601072206035945830580000000001-928374650001928192-1-73-00000001-test_json_usertable_no_split-1.ndjson
 ├── parquet/defaultdb/public/test-parquet_simple_test_no_split/1767823340/
-│   ├── 202601072219387314680380000000000-...-test_parquet_simple_test_no_split-1.parquet
+│   ├── 202601072219387314680380000000000-928374650001928192-1-72-00000000-test_parquet_simple_test_no_split-1.parquet
 │   └── ...
 └── ...
 ```
+
+**CockroachDB File Naming Pattern:**
+```
+{timestamp}-{jobid}-{node}-{topic}-{sequence}-{table}-{file_num}.parquet
+└─────┬────┘ └──┬──┘ └─┬─┘ └─┬──┘ └───┬───┘ └──┬──┘ └────┬────┘
+  Nanosec   Job ID  Node  Topic  Sequence Table   File seq
+  timestamp                                        number
+```
+
+**Pattern Components:**
+- **Timestamp** (`202601072219387314680380000000000`) - Nanosecond precision UTC timestamp
+- **Job ID** (`928374650001928192`) - Unique changefeed job identifier
+- **Node** (`1`) - CockroachDB node ID that wrote the file
+- **Topic** (`72`) - Internal partition/topic ID for routing
+- **Sequence** (`00000000`) - File sequence number (increments per batch)
+- **Table** (`test_parquet_simple_test_no_split`) - Target table name
+- **File Number** (`1`) - File split number within batch (for large datasets)
+
+**Key Properties:**
+- ✅ **Chronological**: Lexicographic sort = time order
+- ✅ **Deterministic**: Same pattern for JSON (`.ndjson`) and Parquet (`.parquet`)
+- ✅ **Traceable**: Job ID links file back to changefeed
+- ✅ **Analyzable**: Timestamp enables CDC operation classification
 
 **How It Works:**
 1. `test_cdc_matrix.sh` calls `sync_azure_to_volume_compact.py`
@@ -1828,6 +1863,9 @@ spark.read.table("...").filter(F.col("_cdc_operation") == "UNKNOWN") \
 12. **RESYNC_COMMAND_FEATURE.md** - `test_cdc_matrix.sh --resync`
 13. **VOLUME_SYNC_DIRECTORY_FIX.md** - Directory structure preservation
 
+### Investigation Documents (Jan 27, 2026)
+1. **verify_decimal_issue.md** - Investigation plan for `__crdb__updated` DECIMAL(2^31, 0) precision issue
+
 ---
 
 ## 🎯 Production Readiness Checklist
@@ -1858,6 +1896,58 @@ spark.read.table("...").filter(F.col("_cdc_operation") == "UNKNOWN") \
 - [ ] S3/ABFSS support (currently Azure-only)
 - [ ] DLT production deployment example
 - [ ] foreachBatch + MERGE for continuous streaming
+- [x] **DECIMAL Precision Issue - SOLVED!** (Jan 27, 2026) - Root cause: `.RESOLVED` files (CDC watermarks) use `DECIMAL(2147483647, 0)` encoding, data files don't. Solution: Filter `.RESOLVED` files using `pathGlobFilter` (see `docs/DECIMAL_MYSTERY_SOLVED.md`)
+
+### 🐛 GitHub Issues Filed (CockroachDB)
+
+**Issue #161962** - Bug Report (Jan 28, 2026)  
+**Title**: changefeedccl: parquet .RESOLVED files use DECIMAL(2147483647, 0) breaking Spark consumers  
+**Status**: Open | **Jira**: CRDB-59198  
+**URL**: https://github.com/cockroachdb/cockroach/issues/161962
+
+**Problem**: `.RESOLVED` files (CDC watermark tracking) use `DECIMAL(2147483647, 0)` precision, exceeding Apache Spark's maximum DECIMAL precision (38). Affects all Spark-based CDC consumers (Databricks, AWS Glue, EMR, Azure Synapse).
+
+**Root Cause**:
+- Data files: Use `StringType` for timestamps (`__crdb__updated`) ✅
+- `.RESOLVED` files: Use `DECIMAL(2147483647, 0)` for `resolved` column ❌
+- Caused by: `pkg/util/parquet/schema.go` line 176 sets precision to `math.MaxInt32` when precision=0
+
+**Current Workaround**: 
+```python
+.option("pathGlobFilter", "*usertable*.parquet")  # Excludes .RESOLVED files
+```
+
+**Suggested Fix**: Change `.RESOLVED` files to use `StringType` (matching data files)
+
+---
+
+**Issue #161963** - Feature Request (Jan 28, 2026)  
+**Title**: changefeedccl: Enable primary key metadata in production Parquet files (already available in test builds)  
+**Status**: Open | **Jira**: CRDB-59199  
+**URL**: https://github.com/cockroachdb/cockroach/issues/161963
+
+**Problem**: Production Parquet files don't include primary key metadata, forcing manual configuration in all downstream CDC consumers. Creates internal inconsistency—JSON, Avro, and Kafka formats already include PK information.
+
+**Comparison with CockroachDB's own formats**:
+- **JSON**: ✅ Primary keys in separate key message (`encoder_json.go:52-56`)
+- **Avro**: ✅ Primary keys in separate key schema (`encoder_avro.go:27-29, 147`)
+- **Kafka**: ✅ Primary keys in Kafka message key field (`sink_kafka.go:401`)
+- **Parquet**: ❌ **No primary key metadata** in production (✅ available in test builds)
+
+**Solution**: Enable test metadata for production builds (already implemented in `parquet.go:238-327`)
+
+**Proposed Metadata**:
+```
+cockroach.primary_keys: "col1,col2"
+```
+
+**Benefits**:
+- Self-describing Parquet files
+- Auto-generate MERGE operations in Spark/Databricks
+- Eliminates 500-line configuration files for multi-table CDC pipelines
+- Minimal overhead: ~50-200 bytes per file (0.0002%)
+
+**Impact**: All CockroachDB changefeed users consuming Parquet files (Databricks, AWS Glue, EMR, Azure Synapse)
 
 ---
 
@@ -2727,6 +2817,67 @@ metadata_columns = [
 **References:**
 - ITERATOR_DEDUPLICATION_FIX.md
 - cockroachdb.py lines 5480-5603
+
+---
+
+### ❌ 24. Reading Directory Without Filtering .RESOLVED Files
+**Attempted:** Before Jan 27, 2026  
+**Problem:** `DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION` error when reading changefeed directories
+
+**What we tried:**
+```python
+# WRONG - Reads ALL files including .RESOLVED
+raw_df = (spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "parquet")
+    .load(source_path)  # Reads everything!
+)
+```
+
+**Why it failed:**
+- CockroachDB creates `.RESOLVED` files (Parquet format) to track CDC watermarks
+- `.RESOLVED` files contain `resolved` column with `DECIMAL(2147483647, 0)` encoding
+- Spark validates ALL Parquet files in directory, including `.RESOLVED`
+- Result: `DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION` error during schema validation
+
+**Key Discovery (Jan 27, 2026):**
+- **Data files** (`usertable-*.parquet`) → Use `StringType` for timestamps → ✅ No DECIMAL issue
+- **`.RESOLVED` files** → Use `DECIMAL(2147483647, 0)` for watermarks → ❌ Exceeds Spark's max precision (38)
+
+**Evidence:**
+```
+📁 2026-01-26: 1 data file + 138 .RESOLVED files
+📁 2026-01-27: 0 data files + 94 .RESOLVED files
+
+🧪 Test Results:
+   ✅ usertable-*.parquet → Reads successfully
+   ❌ *.RESOLVED → DECIMAL_PRECISION_EXCEEDS_MAX_PRECISION
+```
+
+**Correct approach:**
+```python
+# CORRECT - Filter out .RESOLVED files
+raw_df = (spark.readStream
+    .format("cloudFiles")
+    .option("cloudFiles.format", "parquet")
+    .option("pathGlobFilter", "*usertable*.parquet")  # ← Excludes .RESOLVED!
+    .load(source_path)
+)
+```
+
+**Why this works:**
+- `pathGlobFilter` only matches data files with "usertable" in name
+- `.RESOLVED` files are excluded from processing
+- Spark never encounters the problematic DECIMAL metadata
+- No explicit schema needed!
+
+**Lesson:** CockroachDB `.RESOLVED` files are CDC metadata (watermark tracking), not data. Always filter them out when reading changefeed directories unless you specifically need watermark information.
+
+**References:**
+- DECIMAL_MYSTERY_SOLVED.md
+- verify_decimal_issue.md
+- stream-changefeed-to-databricks-azure.ipynb Cell 8 (root cause test)
+- stream-changefeed-to-databricks-azure.ipynb Cell 9 (best solution)
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Monitor CockroachDB Pipeline Execution
-# Usage: ./monitor_pipeline.sh [pipeline_name] [catalog] [schema]
+# Usage: ./monitor_pipeline.sh [pipeline_name] [catalog] [schema] [pipeline_id] [--no-start]
 
 set -e
 
@@ -8,6 +8,21 @@ PIPELINE_NAME="${1:-robert_lee_cockroachdb}"
 CATALOG="${2:-main}"
 SCHEMA="${3:-robert_lee_cockroachdb_cdc}"
 PIPELINE_ID="${4-''}"
+NO_START=false
+
+# Check for --no-start flag in any remaining arguments
+shift 4 2>/dev/null || true
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-start)
+            NO_START=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 echo "🚀 CockroachDB Pipeline Monitor"
 echo "════════════════════════════════════════════════════════"
@@ -34,23 +49,44 @@ fi
 echo "   ✅ Pipeline ID: $PIPELINE_ID"
 echo ""
 
-# Start full refresh
-echo "🔄 Step 2: Starting full refresh..."
-UPDATE_OUTPUT=$(databricks pipelines start-update "$PIPELINE_ID" \
-  --full-refresh \
-  --output json 2>&1)
+# Start full refresh or monitor existing
+if [ "$NO_START" = false ]; then
+    echo "🔄 Step 2: Starting full refresh..."
+    UPDATE_OUTPUT=$(databricks pipelines start-update "$PIPELINE_ID" \
+      --full-refresh \
+      --output json 2>&1)
 
-UPDATE_ID=$(echo "$UPDATE_OUTPUT" | jq -r '.update_id' 2>/dev/null)
+    UPDATE_ID=$(echo "$UPDATE_OUTPUT" | jq -r '.update_id' 2>/dev/null)
 
-if [ -z "$UPDATE_ID" ] || [ "$UPDATE_ID" == "null" ]; then
-    echo "❌ Failed to start update"
-    echo "$UPDATE_OUTPUT"
-    exit 1
+    if [ -z "$UPDATE_ID" ] || [ "$UPDATE_ID" == "null" ]; then
+        echo "❌ Failed to start update"
+        echo "$UPDATE_OUTPUT"
+        exit 1
+    fi
+
+    echo "   ✅ Update ID: $UPDATE_ID"
+    echo "   ✅ Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+else
+    echo "🔍 Step 2: Getting latest update..."
+    # Get the most recent update for this pipeline
+    PIPELINE_INFO=$(databricks pipelines get "$PIPELINE_ID" --output json 2>/dev/null)
+    UPDATE_ID=$(echo "$PIPELINE_INFO" | jq -r '.latest_updates[0].update_id // empty')
+    
+    if [ -z "$UPDATE_ID" ]; then
+        echo "❌ No active or recent updates found for this pipeline"
+        echo ""
+        echo "💡 To start a new run, use:"
+        echo "   ./monitor_pipeline.sh $PIPELINE_NAME $CATALOG $SCHEMA $PIPELINE_ID"
+        exit 1
+    fi
+    
+    UPDATE_STATE=$(echo "$PIPELINE_INFO" | jq -r '.latest_updates[0].state // empty')
+    echo "   ✅ Update ID: $UPDATE_ID"
+    echo "   ℹ️  Current State: $UPDATE_STATE"
+    echo "   ℹ️  Monitoring mode: Will not start new update"
+    echo ""
 fi
-
-echo "   ✅ Update ID: $UPDATE_ID"
-echo "   ✅ Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-echo ""
 
 # Monitor progress
 echo "⏳ Step 3: Monitoring progress..."

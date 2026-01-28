@@ -19,9 +19,7 @@ sources/*/secrets.*
 sources/*/test_credentials.json
 sources/**/manual_setup_test.sh
 **/cockroachdb_cdc_*.env
-*.env
-
-# Credential JSON files (but allow templates)
+*.env# Credential JSON files (but allow templates)
 sources/**/.env/cockroachdb_cdc_azure.json
 sources/**/.env/cockroachdb_credentials.json
 sources/**/.env/cockroachdb_pipelines.json

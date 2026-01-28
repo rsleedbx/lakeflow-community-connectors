@@ -1,0 +1,20 @@
+{
+  "_comment": "Example configuration for AZURE_PARQUET mode",
+  "_description": "Use for production CDC with Parquet changefeeds in Azure Blob Storage",
+  "_note": "Mode suffix '_azure_parquet' will be automatically appended to pipeline_name and schema",
+  
+  "pipeline_name": "my_cockroachdb",
+  "mode": "azure_parquet",
+  "catalog": "main",
+  "schema": "my_schema",
+  
+  "azure_config": "./.env/cockroachdb_cdc_azure.json",
+  "blob_prefix": "parquet/defaultdb/public/usertable",
+  
+  "_azure_config_format": {
+    "account_name": "mystorageaccount",
+    "account_key": "base64_encoded_key==",
+    "container_name": "cockroachdb-cdc",
+    "base_url": "https://mystorageaccount.blob.core.windows.net"
+  }
+}

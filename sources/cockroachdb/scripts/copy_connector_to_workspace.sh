@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Deploy CockroachDB connector to Databricks workspace
-# Usage: ./copydir.sh (from sources/cockroachdb directory)
-#    or: ./sources/cockroachdb/scripts/copydir.sh (from repo root)
+# Copy CockroachDB connector code to Databricks workspace
+#
+# This script copies connector files to the workspace but does NOT create the pipeline.
+# Pipeline creation is done separately by deploy_pipeline.sh or databricks bundle.
+#
+# Usage: ./copy_connector_to_workspace.sh [MODE_SUFFIX]
+#    MODE_SUFFIX: Optional suffix like "_direct", "_volume", etc.
+#
+# Examples:
+#   ./copy_connector_to_workspace.sh           # No suffix: cockroachdb/
+#   ./copy_connector_to_workspace.sh _direct   # With suffix: cockroachdb_direct/
 
 # Exit on error
 trap 'trap - ERR; kill -INT $$' ERR
 set -e
 
 SOURCE_NAME="cockroachdb"
+MODE_SUFFIX="${1:-}"  # Optional mode suffix parameter
 
 # Find repository root using git
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
@@ -33,14 +42,17 @@ echo ""
 USER_NAME=$(databricks current-user me --output json | jq -r '.userName')
 WORKSPACE_URL=$(databricks auth env --output json | jq -r '.env.DATABRICKS_HOST')
 
-# Set paths
+# Set paths (append mode suffix if provided)
 WORKSPACE_PATH="/Workspace/Users/$USER_NAME"
-PROJECT_NAME="${SOURCE_NAME}"
+PROJECT_NAME="${SOURCE_NAME}${MODE_SUFFIX}"
 PROJECT_PATH="$WORKSPACE_PATH/$PROJECT_NAME"
 
-echo "Deploying $SOURCE_NAME connector..."
+echo "Copying $SOURCE_NAME connector code to workspace..."
 echo "User: $USER_NAME"
 echo "Destination: $PROJECT_PATH"
+if [ -n "$MODE_SUFFIX" ]; then
+    echo "Mode suffix: $MODE_SUFFIX"
+fi
 echo ""
 
 # Generate the merged source file
@@ -79,7 +91,7 @@ rm -rf "$TEMP_DIR"
 unset TEMP_DIR
 
 echo ""
-echo "✅ Deployment complete!"
+echo "✅ Connector code copied to workspace!"
 echo ""
 echo "📁 Workspace location:"
 echo "   $PROJECT_PATH"

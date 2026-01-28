@@ -1,0 +1,20 @@
+{
+  "_comment": "Example configuration for DIRECT mode (sinkless changefeed)",
+  "_description": "Use for testing/development with live CockroachDB connection",
+  "_note": "Mode suffix '_direct' will be automatically appended to pipeline_name and schema",
+  
+  "pipeline_name": "my_cockroachdb",
+  "mode": "direct",
+  "catalog": "main",
+  "schema": "my_schema",
+  
+  "crdb_config": ".env/cockroachdb_connection.json",
+  "table_list": "usertable,orders,customers",
+  
+  "_crdb_config_format": {
+    "_comment": "The crdb_config file should contain CockroachDB connection details",
+    "cockroachdb_url": "postgresql://user:password@hostname:26257/defaultdb?sslmode=verify-full",
+    "token": "optional_api_token_for_serverless",
+    "base_url": "https://cockroachlabs.cloud"
+  }
+}

@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: lakeflow-community-connectors
+Version: 0.1.0
+Summary: Lakeflow community connectors built on Spark Python Data Source API
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: pyspark>=3.5.0
+Requires-Dist: pydantic>=2.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+
 # Lakeflow Community Connectors
 
 Lakeflow community connectors are built on top of the [Spark Python Data Source API](https://spark.apache.org/docs/latest/api/python/tutorial/sql/python_data_source.html) and [Spark Declarative Pipeline (SDP)](https://www.databricks.com/product/data-engineering/spark-declarative-pipelines). These connectors enable users to ingest data from various source systems.
@@ -23,8 +35,8 @@ This directory includes generic shared test suites to validate any connector sou
 ### Running Tests
 
 ```bash
-# Install package with dev dependencies (required for tests)
-pip install -e ".[dev]"
+# Install package in editable mode (required for tests)
+pip install -e .
 
 # Run all tests
 pytest -v
@@ -33,28 +45,7 @@ pytest -v
 pytest sources/github/test/ -v
 ```
 
-### VS Code Integration
-
-Pre-configured VS Code settings for testing:
-- **Test Explorer**: Visual test runner with debugging
-- **Tasks**: One-click test execution
-- **Databricks Connect**: Run tests locally with remote Spark execution
-
-```bash
-# Quick setup - copy example configurations
-cp .vscode/settings.example.json .vscode/settings.json
-cp .vscode/launch.example.json .vscode/launch.json
-cp .vscode/tasks.example.json .vscode/tasks.json
-
-# Configure Databricks Connect
-./setup_databricks_connect.sh
-```
-
-See **[TESTING.md](TESTING.md)** for comprehensive testing guide including:
-- macOS testing limitations
-- Databricks Connect setup
-- VS Code integration
-- CI/CD examples
+See **[TESTING.md](TESTING.md)** for detailed testing instructions.
 
 ## TODO:
 1. Add dev guidelines

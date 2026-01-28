@@ -1,0 +1,19 @@
+{
+  "_comment": "Example configuration for VOLUME mode (Unity Catalog Volumes)",
+  "_description": "Use for file-based testing with pre-synced CDC data",
+  "_note": "Mode suffix '_volume' will be automatically appended to pipeline_name and schema",
+  
+  "pipeline_name": "my_cockroachdb",
+  "mode": "volume",
+  "catalog": "main",
+  "schema": "my_schema",
+  
+  "volume_name": "cdc_files",
+  
+  "_notes": [
+    "Volume path will be constructed as: /Volumes/{catalog}/{schema}/{volume_name}",
+    "Ensure volume is populated using sync_azure_to_volume_compact.py before deployment",
+    "Volume should contain timestamped directories with parquet/json files",
+    "Optional: _metadata/schema.json for schema information"
+  ]
+}

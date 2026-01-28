@@ -1,0 +1,20 @@
+{
+  "_comment": "Example configuration for AZURE_DUAL mode",
+  "_description": "Use when you have both JSON and Parquet changefeeds for the same table",
+  "_note": "Mode suffix '_azure_dual' will be automatically appended to pipeline_name and schema",
+  
+  "pipeline_name": "my_cockroachdb",
+  "mode": "azure_dual",
+  "catalog": "main",
+  "schema": "my_schema",
+  
+  "azure_config": "./.env/cockroachdb_cdc_azure.json",
+  "blob_prefix": "json/defaultdb/public/usertable",
+  
+  "_notes": [
+    "Reads both JSON and Parquet files from the same path prefix",
+    "Useful during format migration or for redundancy",
+    "Connector automatically detects and processes both formats",
+    "Ensures deduplication across formats"
+  ]
+}

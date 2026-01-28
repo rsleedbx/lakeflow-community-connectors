@@ -117,6 +117,10 @@ class LakeflowConnectTester:
                 )
 
         except Exception as e:
+            # Set connector to None so other tests can check this attribute
+            self.connector = None
+            self.connector_test_utils = None
+            
             self._add_result(
                 TestResult(
                     test_name="test_initialization",

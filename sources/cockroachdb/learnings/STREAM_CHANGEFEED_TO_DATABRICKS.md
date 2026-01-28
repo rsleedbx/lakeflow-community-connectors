@@ -1,5 +1,9 @@
 # Stream a Changefeed to Databricks
 
+> ⚠️ **SYNC NOTE**: This markdown file is synchronized with `STREAM_CHANGEFEED_TO_DATABRICKS.ipynb`. When updating one file, please update the other to maintain consistency.
+> 
+> 📚 **FOR PRODUCTION DEPLOYMENTS**: See the comprehensive Azure-specific guide at `sources/cockroachdb/docs/stream-changefeed-to-databricks-azure.md`, which includes schema file requirements, SDP configuration, Community Edition compatibility, and TB-scale deployment guidance.
+
 **For submission to:** CockroachDB Documentation  
 **Author:** Lakeflow Community Connectors  
 **Date:** 2025-12-23
@@ -151,9 +155,7 @@ Back in the built-in SQL shell, create a changefeed with Parquet format:
 
 ```sql
 CREATE CHANGEFEED FOR TABLE ecommerce.public.orders
-INTO 'azure://changefeed-events/parquet/ecommerce/public/?
-    AZURE_ACCOUNT_NAME={your-storage-account-name}&
-    AZURE_ACCOUNT_KEY={your-storage-account-key}'
+INTO 'azure://changefeed-events/parquet/ecommerce/public/?AZURE_ACCOUNT_NAME={your-storage-account-name}&AZURE_ACCOUNT_KEY={your-storage-account-key}'
 WITH 
     format = 'parquet',
     compression = 'gzip',
@@ -179,9 +181,7 @@ JSON format provides:
 
 ```sql
 CREATE CHANGEFEED FOR TABLE ecommerce.public.orders
-INTO 'azure://changefeed-events/json/ecommerce/public/?
-    AZURE_ACCOUNT_NAME={your-storage-account-name}&
-    AZURE_ACCOUNT_KEY={your-storage-account-key}'
+INTO 'azure://changefeed-events/json/ecommerce/public/?AZURE_ACCOUNT_NAME={your-storage-account-name}&AZURE_ACCOUNT_KEY={your-storage-account-key}'
 WITH 
     format = 'json',
     envelope = 'wrapped',

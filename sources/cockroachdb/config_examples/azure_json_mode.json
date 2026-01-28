@@ -1,0 +1,19 @@
+{
+  "_comment": "Example configuration for AZURE_JSON mode",
+  "_description": "Use for production CDC with JSON changefeeds in Azure Blob Storage",
+  "_note": "Mode suffix '_azure_json' will be automatically appended to pipeline_name and schema",
+  
+  "pipeline_name": "my_cockroachdb",
+  "mode": "azure_json",
+  "catalog": "main",
+  "schema": "my_schema",
+  
+  "azure_config": "./.env/cockroachdb_cdc_azure.json",
+  "blob_prefix": "json/defaultdb/public/usertable",
+  
+  "_notes": [
+    "JSON format uses 'before'/'after' envelope structure",
+    "Good for debugging and human-readable CDC streams",
+    "Larger file sizes compared to Parquet"
+  ]
+}
