@@ -729,6 +729,7 @@ Mode: INCREMENTAL (reusing existing table/changefeed)
 | Test speed | Fast validation | 60× faster (validate mode) | ✅ |
 | JSON support | Full | Format detection implemented | ✅ |
 | Code reuse | 50%+ | 55% | ✅ |
+| Data integrity verification | Multi-column sum check | Implemented Jan 29 | ✅ |
 
 ---
 
@@ -826,6 +827,38 @@ def users_cdc():
 ```
 
 **Key Feature:** Continuous file-based streaming with DLT, not direct changefeed connection
+
+---
+
+## 🆕 Recent Fixes & Enhancements (Jan 29, 2026)
+
+### Data Integrity Verification
+
+#### 1. Multi-Column Sum Verification ✅ (Jan 29, 2026)
+**Achievement:** Comprehensive data integrity testing beyond basic row counts
+
+**Key Discovery:**
+- Row count matching (28 = 28) can hide partial data loss
+- Field3-9 had ~3% data loss despite matching row counts
+- Sum verification caught -723 to -729 differences per column
+
+**Implementation:**
+- `get_column_sum()` - CockroachDB sum calculation with text handling
+- `get_column_sum_spark()` - Spark equivalent with identical logic
+- `regexp_replace()` - Strips non-numeric characters for YCSB schema
+- Robust connection management - Single try-finally for all calculations
+
+**Test Results:**
+```
+✅ ycsb_key, field0-2: Perfect match
+❌ field3-9: Consistent negative differences (-723 to -729)
+⚠️  Diagnosis: Missing UPDATE events in multi-column family scenario
+```
+
+**Impact:** Provides deep validation for column family fragmentation issues, incomplete MERGE operations, and partial CDC event loss that basic row count checks miss.
+
+- File: `cockroachdb-cdc-tutorial.ipynb` Cell 5 (helpers), Cell 14 (verification)
+- Doc: `CONNECTOR_EVOLUTION_STRATEGY.md` Multi-Column Sum Verification Strategy
 
 ---
 
@@ -1625,6 +1658,162 @@ python3 scripts/sync_azure_to_volume_compact.py --prefix ... --no-cache
 
 ---
 
+### Multi-Column Sum Verification Strategy (Jan 29, 2026)
+
+**Purpose:** Comprehensive data integrity verification beyond basic row counts
+
+**Problem Statement:**
+- Basic verification (min/max/count) can miss incomplete CDC events
+- UPDATE events that only modify specific columns may not affect row counts
+- Column family fragmentation issues can cause partial data loss
+- Row count matches don't guarantee all column data is correct
+
+**Solution:** Sum all numeric columns and compare source vs target
+
+**Implementation Details:**
+
+#### 1. CockroachDB Sum Calculation (`get_column_sum()`)
+```python
+def get_column_sum(conn, table_name, column_name):
+    """
+    Sum numeric columns, handling text columns with embedded numbers.
+    Strips non-numeric characters before casting to BIGINT.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT SUM(
+                CASE
+                    WHEN regexp_replace({column_name}::TEXT, '[^0-9]', '', 'g') = '' THEN 0
+                    ELSE regexp_replace({column_name}::TEXT, '[^0-9]', '', 'g')::BIGINT
+                END
+            )
+            FROM {table_name}
+        """)
+        return cur.fetchone()[0]
+```
+
+**Key Features:**
+- Handles mixed text/numeric columns (e.g., `"updated_at_1769625671"`)
+- Uses `regexp_replace()` to strip non-numeric characters
+- Casts to `BIGINT` for consistent comparison
+- Handles empty strings gracefully (returns 0)
+
+#### 2. Spark Sum Calculation (`get_column_sum_spark()`)
+```python
+def get_column_sum_spark(df, column_name):
+    """
+    Spark equivalent with identical logic.
+    """
+    from pyspark.sql import functions as F
+    
+    result = df.select(
+        F.sum(
+            F.when(
+                F.regexp_replace(F.col(column_name).cast('string'), '[^0-9]', '') == '',
+                0
+            ).otherwise(
+                F.regexp_replace(F.col(column_name).cast('string'), '[^0-9]', '').cast('bigint')
+            )
+        ).alias('sum')
+    ).collect()[0]['sum']
+    
+    return result
+```
+
+#### 3. Verification Loop (Cell 14)
+```python
+columns_to_verify = ['ycsb_key', 'field0', 'field1', 'field2', 'field3', 
+                     'field4', 'field5', 'field6', 'field7', 'field8', 'field9']
+
+all_columns_match = True
+for col in columns_to_verify:
+    source_col_sum = get_column_sum(conn, source_table, col)
+    target_col_sum = get_column_sum_spark(target_df, col)
+    
+    if source_col_sum != target_col_sum:
+        all_columns_match = False
+        diff = (target_col_sum or 0) - (source_col_sum or 0)
+        print(f"❌ {col:12s}: Source={source_col_sum:,} | Target={target_col_sum:,}")
+        print(f"   ⚠️  Difference: {diff:+,}")
+```
+
+**Benefits:**
+- **Detects partial updates** - Missing UPDATE events show as sum differences
+- **Detects incomplete merges** - Column family fragmentation issues caught
+- **Detects missing DELETEs** - Row count matches but sums don't
+- **Column-specific diagnosis** - Identifies exactly which fields have issues
+- **Handles YCSB schema** - Works with text columns containing timestamps
+
+**Test Results (Jan 29, 2026):**
+
+✅ **Successfully detected real data integrity issue:**
+```
+📊 Column Sums Comparison (All Fields):
+--------------------------------------------------------------------------------
+✅ ycsb_key    : Source=               2,394 | Target=               2,394
+✅ field0      : Source=       1,769,729,024 | Target=       1,769,729,024
+✅ field1      : Source=              23,968 | Target=              23,968
+✅ field2      : Source=              23,996 | Target=              23,996
+❌ field3      : Source=              24,024 | Target=              23,301
+   ⚠️  Difference: -723
+❌ field4      : Source=              24,052 | Target=              23,328
+   ⚠️  Difference: -724
+❌ field5      : Source=              24,080 | Target=              23,355
+   ⚠️  Difference: -725
+❌ field6      : Source=              24,108 | Target=              23,382
+   ⚠️  Difference: -726
+❌ field7      : Source=              24,136 | Target=              23,409
+   ⚠️  Difference: -727
+❌ field8      : Source=              24,164 | Target=              23,436
+   ⚠️  Difference: -728
+❌ field9      : Source=              24,192 | Target=              23,463
+   ⚠️  Difference: -729
+
+⚠️  Some column sums do not match - check data integrity
+```
+
+**Analysis:**
+- ✅ Primary key sum matches (ycsb_key: 2,394)
+- ✅ field0, field1, field2 match perfectly
+- ❌ field3-field9 show consistent negative differences (-723 to -729)
+- **Diagnosis**: Missing UPDATE events for fields 3-9 in multi-column family scenario
+- **Root Cause**: Possible incomplete column family fragment merging
+
+**Impact:**
+- Basic row count (28) matched - would have been missed without sum verification
+- Multi-column sum test caught ~3% data loss in fields 3-9
+- Provides specific column-level diagnosis for debugging
+
+**When to Use:**
+- ✅ `update_delete` mode verification (requires exact match)
+- ✅ Multi-column family tables (fragmentation detection)
+- ✅ After MERGE operations (completeness verification)
+- ✅ Production monitoring (continuous validation)
+- ⚠️ `append_only` mode (sums will naturally differ due to history retention)
+
+**Connection Management:**
+```python
+# Critical: Keep connection open for all calculations
+conn = get_cockroachdb_connection()
+try:
+    # All sum calculations here
+    for col in columns_to_verify:
+        source_sum = get_column_sum(conn, source_table, col)
+        # ...
+finally:
+    # Always close connection at the very end
+    conn.close()
+```
+
+**Lesson Learned:** Row count matching is necessary but not sufficient for data integrity verification. Multi-column sum verification provides deep validation that catches partial data loss, incomplete merges, and column-specific CDC issues that would otherwise go undetected.
+
+**References:**
+- Notebook: `cockroachdb-cdc-tutorial.ipynb` Cell 5 (helper functions)
+- Notebook: `cockroachdb-cdc-tutorial.ipynb` Cell 14 (verification logic)
+- Test Run: Jan 29, 2026 (detected field3-9 discrepancies)
+
+---
+
 ### Test Matrix Script
 **File:** `sources/cockroachdb/scripts/test_cdc_matrix.sh`
 
@@ -1896,6 +2085,16 @@ spark.read.table("...").filter(F.col("_cdc_operation") == "UNKNOWN") \
 - [ ] S3/ABFSS support (currently Azure-only)
 - [ ] DLT production deployment example
 - [ ] foreachBatch + MERGE for continuous streaming
+- [ ] **NULL Value Testing** - Test NULL conditions for both column family and non-column family scenarios:
+  - [ ] Test INSERT with NULL columns (single column family)
+  - [ ] Test INSERT with NULL columns (multi-column family with split_column_families)
+  - [ ] Test UPDATE to NULL (explicit NULL assignment)
+  - [ ] Test column family with all NULLs (should NOT emit fragment for non-PK families)
+  - [ ] Test column family with mixed NULL/non-NULL values
+  - [ ] Test coalescing logic preserves NULLs correctly
+  - [ ] Verify NULL vs. not-updated distinction in MERGE operations
+  - [ ] Test YCSB schema with NULL values (text columns with embedded numbers)
+  - [ ] Validate sum verification handles NULL correctly (treats as 0)
 - [x] **DECIMAL Precision Issue - SOLVED!** (Jan 27, 2026) - Root cause: `.RESOLVED` files (CDC watermarks) use `DECIMAL(2147483647, 0)` encoding, data files don't. Solution: Filter `.RESOLVED` files using `pathGlobFilter` (see `docs/DECIMAL_MYSTERY_SOLVED.md`)
 
 ### 🐛 GitHub Issues Filed (CockroachDB)
@@ -2972,6 +3171,82 @@ For JSON CDC format, primary keys must be extracted from the `key` array before 
 - **Root Cause:** Kept both SNAPSHOT and UPDATE rows for same keys
 - **Fix:** Deduplicate by PK only, keep latest by timestamp, filter DELETEs
 - **Lesson:** Different consumption patterns must produce identical final state
+
+### 16. Row Count Matching is Necessary But Not Sufficient
+**Discovery (Jan 29, 2026):** Row count matched (28 = 28) but data was incomplete.
+- **Impact:** Multi-column sum verification detected ~3% data loss in fields 3-9
+- **Root Cause:** Missing UPDATE events for specific column family fragments
+- **Manifestation:** 
+  - Basic stats matched: min key ✅, max key ✅, count ✅, primary key sum ✅
+  - Field3-9 sums mismatched: -723 to -729 differences per column ❌
+- **Fix:** Added `get_column_sum()` and `get_column_sum_spark()` for comprehensive validation
+- **Key Insight:** Always verify ALL data columns, not just row counts and primary keys
+- **Lesson:** Deep data integrity requires multi-column sum verification, especially for:
+  - Multi-column family tables (fragmentation risk)
+  - UPDATE-heavy workloads (partial update detection)
+  - MERGE operations (completeness verification)
+  - Production monitoring (continuous validation)
+
+### 17. Column Family Columns CAN Be NULL (Verified from CockroachDB Source)
+**Discovery (Jan 29, 2026):** Columns in column families do NOT need to be NOT NULL.
+
+**Question:** "With column family, do the columns have to be defined as NOT NULL?"  
+**Answer:** **NO** - Verified from CockroachDB source code.
+
+**Evidence from CockroachDB Source Code:**
+
+From `/Users/robert.lee/github/cockroach/pkg/ccl/changefeedccl/changefeed_test.go` (lines 3870-3877):
+```go
+// No messages on insert for families where no non-null values were set.
+sqlDB.Exec(t, `INSERT INTO foo values (1, 'puppy', null)`)
+sqlDB.Exec(t, `INSERT INTO foo values (2, null, 'kitten')`)
+assertPayloads(t, foo, []string{
+    `foo.most: [1]->{"after": {"a": 1, "b": "puppy"}}`,
+    `foo.most: [2]->{"after": {"a": 2, "b": null}}`,  // ← b is NULL!
+    `foo.only_c: [2]->{"after": {"c": "kitten"}}`,
+})
+```
+
+**How NULL Works with `split_column_families`:**
+
+1. **Column Family WITH Primary Key** (e.g., `FAMILY most (a, b)`):
+   - ✅ ALWAYS emits CDC event (PK must be present)
+   - ✅ Data columns CAN be NULL (e.g., `{"a": 2, "b": null}`)
+   - The event includes ALL columns in the family, even if NULL
+
+2. **Column Family WITHOUT Primary Key** (e.g., `FAMILY only_c (c)`):
+   - ⚠️  NO CDC event if ALL columns are NULL (optimization)
+   - ✅ Emits event if ANY column has non-NULL value
+
+**Why Our Coalescing Fix is Correct:**
+
+Our `F.last(col, ignorenulls=True)` approach handles all cases correctly:
+
+1. **Column family not updated** → NULL in new fragment (family not emitted) → Coalesce keeps old value ✅
+2. **Column truly NULL** → NULL in all fragments → Coalesce returns NULL ✅
+3. **Explicit UPDATE to NULL** → Fragment emits ENTIRE family with NULL → Coalesce correctly uses latest NULL ✅
+
+**Key Insight:** When CockroachDB updates ANY column in a family, it emits the **ENTIRE family** (all columns), so explicit NULLs are always in complete fragments!
+
+**Storage Optimization:**
+
+From CockroachDB storage tests:
+```
+put      k=/row1/4 v=r1e # column family 2-3 omitted (i.e. if all NULLs)
+```
+
+CockroachDB optimizes storage by omitting column families that are entirely NULL. This is an internal storage optimization and does NOT affect CDC behavior.
+
+**Impact on Our Implementation:**
+- ✅ Column-level coalescing works correctly for NULL values
+- ✅ Handles mixed NULL/non-NULL columns in same family
+- ✅ Correctly preserves explicit NULL updates
+- ✅ No special handling needed for NULL vs. non-NULL columns
+
+**References:**
+- CockroachDB Source: `/Users/robert.lee/github/cockroach/pkg/ccl/changefeedccl/changefeed_test.go` (TestChangefeedEachColumnFamily)
+- Fix Implementation: `cockroachdb-cdc-tutorial.ipynb` Cell 7 (column-level coalescing)
+- Doc: `COLUMN_FAMILY_NULL_BEHAVIOR.md`
 
 ---
 

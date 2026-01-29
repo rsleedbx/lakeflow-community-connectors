@@ -1,8 +1,10 @@
 # Stream a Changefeed to Databricks
 
-> ⚠️ **SYNC NOTE**: This markdown file is synchronized with `STREAM_CHANGEFEED_TO_DATABRICKS.ipynb`. When updating one file, please update the other to maintain consistency.
+> ⚠️ **ARCHIVED VERSION**: This is the original general guide. For current production deployments, see:
+> - **📚 Primary Guide**: `sources/cockroachdb/docs/stream-changefeed-to-databricks-azure.md` (comprehensive Azure deployment with SCD types, column families, Unity Catalog)
+> - **💻 Working Notebook**: `sources/cockroachdb/docs/cockroachdb-cdc-tutorial.ipynb` (executable tutorial with full code)
 > 
-> 📚 **FOR PRODUCTION DEPLOYMENTS**: See the comprehensive Azure-specific guide at `sources/cockroachdb/docs/stream-changefeed-to-databricks-azure.md`, which includes schema file requirements, SDP configuration, Community Edition compatibility, and TB-scale deployment guidance.
+> This file is kept for reference and general concepts. The production guide includes advanced features like `append_only`/`update_delete` modes, `single_cf`/`multi_cf` support, and key challenges/solutions.
 
 **For submission to:** CockroachDB Documentation  
 **Author:** Lakeflow Community Connectors  
