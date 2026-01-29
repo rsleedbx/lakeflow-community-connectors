@@ -9,12 +9,13 @@ History:
 - These functions existed in the notebook's Cell 6
 - They were later deleted/removed
 - This file recreates them based on the backup file
-- They represent the code BEFORE the column family NULL fix was applied
 
-Note: For the updated column family NULL fix (deduplicate_to_latest_state parameter),
-see merge_column_family_fragments() in cockroachdb.py
+Note: merge_column_family_fragments() has been updated with the latest version
+from cockroachdb.py that includes the deduplicate_to_latest_state parameter
+for robust NULL handling in column families.
 """
 
+from typing import List
 from pyspark.sql import functions as F
 
 
@@ -383,60 +384,392 @@ def ingest_cdc_with_merge_single_family(
     }
 
 
-def merge_column_family_fragments(df, primary_key_columns, spark):
+def merge_column_family_fragments(
+    df,
+    primary_key_columns: List[str],
+    metadata_columns: List[str] = None,
+    debug: bool = False,
+    is_streaming: bool = None,
+    deduplicate_to_latest_state: bool = False
+):
     """
-    Merge column family fragments into complete rows (streaming-compatible).
+    Merge column family fragments into complete rows.
     
-    When split_column_families=true, CockroachDB creates multiple CDC events per row update,
-    one for each column family. This function merges these fragments by:
-    1. Grouping by (primary_key + _cdc_timestamp + _cdc_operation)
-    2. Using first(col, ignorenulls=True) to coalesce NULL values from different fragments
+    When split_column_families=true, CockroachDB writes one Parquet file per column family,
+    resulting in multiple fragment records per logical row. This function merges these
+    fragments by grouping on primary key and taking the first non-null value for each column.
     
-    Each fragment has:
-    - Primary key columns (always present)
-    - Data for ONE column family (other columns are NULL)
-    - Same _cdc_timestamp and _cdc_operation
+    **Streaming vs Batch Mode:**
+    - **Streaming DataFrames** (from Autoloader): Always applies merge (can't detect beforehand)
+    - **Batch DataFrames** (from spark.read): Auto-detects fragmentation, skips if not needed
+    - Set `is_streaming=True` to force streaming mode (skips detection)
+    - Set `is_streaming=False` to force batch mode (enables detection)
+    
+    **Deduplication Mode (NEW):**
+    - `deduplicate_to_latest_state=False` (default): Merges fragments within same event, preserves all events
+    - `deduplicate_to_latest_state=True`: Coalesces columns across time + deduplicates to latest state
+      * Use when you have multiple UPDATE events for the same key
+      * Preserves old values for columns not touched by newer events
+      * Example: Event1 has field3=3, Event2 updates field0 but leaves field3=NULL
+        → Result keeps field3=3 from Event1 (not NULL from Event2)
     
     Args:
         df: Spark DataFrame with potential column family fragments
         primary_key_columns: List of primary key column names (e.g., ['ycsb_key'])
-        spark: SparkSession
-    
+        metadata_columns: Optional list of metadata columns to preserve
+                         (default: __crdb__*, _cdc_*, _source_*, _rescued_data)
+        debug: Enable debug output showing merge statistics
+        is_streaming: Optional boolean to force streaming/batch mode
+                     (default: auto-detect based on df.isStreaming)
+        deduplicate_to_latest_state: If True, coalesce columns across time and deduplicate to latest row
+                                    (default: False - preserves all CDC events)
+        
     Returns:
-        Merged DataFrame with complete rows
+        Merged Spark DataFrame with complete rows
+        
+    Example (Standard Mode - Preserves All Events):
+        ```python
+        from cockroachdb import merge_column_family_fragments
+        
+        # Read batch data
+        df_raw = spark.read.parquet("dbfs:/Volumes/catalog/schema/volume")
+        
+        # Merge - auto-detects fragmentation, preserves all CDC events
+        df_merged = merge_column_family_fragments(
+            df_raw,
+            primary_key_columns=['ycsb_key'],
+            debug=True
+        )
+        ```
+        
+    Example (Streaming):
+        ```python
+        # Read streaming data (Autoloader)
+        df_raw = spark.readStream.format("cloudFiles").load(...)
+        
+        # Add transformations
+        df_transformed = df_raw.withColumn(...)
+        
+        # Merge - always applies (can't detect on streaming)
+        df_merged = merge_column_family_fragments(
+            df_transformed,
+            primary_key_columns=['ycsb_key'],
+            debug=True
+        )
+        
+        # Write to Delta
+        df_merged.writeStream.toTable(...)
+        ```
+        
+    Example (Deduplication Mode - Latest State with Value Preservation):
+        ```python
+        # For staging → target MERGE scenarios where you want latest state
+        # and need to preserve old column values when newer events don't touch them
+        
+        # Read staging data (may have multiple UPDATE events per key)
+        df_staging = spark.read.table("staging_table")
+        
+        # Merge + deduplicate to latest state (preserves old values)
+        df_latest = merge_column_family_fragments(
+            df_staging,
+            primary_key_columns=['ycsb_key'],
+            deduplicate_to_latest_state=True,  # ← NEW MODE
+            debug=True
+        )
+        
+        # Result: Latest row per key with all column values preserved
+        # - field0 from latest event where field0 was updated
+        # - field3 from earlier event (if latest event didn't touch field3)
+        ```
+        
+    **Technical Details:**
+    
+    *Standard Mode (default):*
+    - Uses `first(col, ignorenulls=True)` to combine NULL values from different fragments
+    - Each fragment has the PK + data for ONE column family (other columns are NULL)
+    - Groups by PK + timestamp + operation to preserve ALL CDC events
+    - For non-split tables, this is a harmless no-op (groupBy preserves all data)
+    
+    *Deduplication Mode (deduplicate_to_latest_state=True):*
+    - Uses `last(col, ignorenulls=True)` over window to coalesce columns across time
+    - Then deduplicates to keep only the latest row per PK
+    - Preserves old values for columns not touched by newer UPDATE events
+    - Essential for handling CockroachDB column families with partial updates
+    
+    **Performance:**
+    - Requires a shuffle operation (groupBy)
+    - For large datasets, consider repartitioning by PK first
+    - Adaptive Query Execution (AQE) helps optimize automatically
     """
     from pyspark.sql import functions as F
     
-    # Get all columns
+    # Auto-detect streaming mode if not explicitly set
+    if is_streaming is None:
+        is_streaming = df.isStreaming
+    
+    # Default metadata columns to preserve
+    if metadata_columns is None:
+        metadata_columns = [
+            '__crdb__event_type', '__crdb__updated', '_rescued_data',
+            '_cdc_operation', '_cdc_timestamp', '_cdc_updated', '_source_file', '_processing_time',
+            '_metadata',  # Unity Catalog metadata
+            # JSON envelope columns (should not be merged as data columns)
+            'after', 'before', 'key', 'updated',
+            # Debug columns
+            '_after_json', '_before_json', '_debug_after_first_10', '_debug_before_first_10'
+        ]
+    
+    # Get all columns from DataFrame
     all_columns = df.columns
     
-    # Metadata columns to preserve (not aggregate as data)
-    metadata_columns = {'_cdc_operation', '_cdc_timestamp', '_rescued_data'}
-    
-    # Data columns = all columns except PK and metadata
+    # Identify data columns (everything except PK and metadata)
     data_columns = [
-        col for col in all_columns
-        if col not in primary_key_columns 
-        and col not in metadata_columns
+        col for col in all_columns 
+        if col not in primary_key_columns and col not in metadata_columns
+        and not col.startswith('__crdb__')
+        and not col.startswith('_cdc_')
+        and not col.startswith('_source_')
+        and not col.startswith('_rescued_')
     ]
     
-    # Group by: PK + timestamp + operation (preserves all distinct CDC events)
-    group_by_cols = primary_key_columns + ['_cdc_timestamp', '_cdc_operation']
+    if debug:
+        mode_str = "Streaming" if is_streaming else "Batch"
+        print(f"\n🔍 Column Family Merge ({mode_str} Mode)")
+        print(f"   Primary key columns: {primary_key_columns}")
+        print(f"   Metadata columns: {len(metadata_columns)} columns")
+        print(f"   Data columns: {len(data_columns)} columns")
+        if len(data_columns) <= 10:
+            print(f"     {data_columns}")
+        else:
+            print(f"     {data_columns[:5]}... (showing first 5)")
+        
+        # DIAGNOSTIC: If no data columns, show what we have
+        if len(data_columns) == 0:
+            print(f"\n⚠️  WARNING: No data columns found!")
+            print(f"   All columns in DataFrame: {all_columns}")
+            print(f"   Metadata columns list: {metadata_columns}")
     
-    # Build aggregation expressions
-    # Use first(col, ignorenulls=True) to merge NULL values from fragments
-    agg_exprs = [
-        F.first(col, ignorenulls=True).alias(col) 
-        for col in data_columns
-    ]
+    # For batch mode: Check if merge is needed
+    # For streaming mode: Always merge (can't count streaming DataFrames)
+    if not is_streaming:
+        try:
+            # Determine timestamp column for fragmentation detection
+            timestamp_col_for_check = None
+            if '_cdc_timestamp' in all_columns:
+                timestamp_col_for_check = '_cdc_timestamp'
+            elif '_cdc_updated' in all_columns:
+                timestamp_col_for_check = '_cdc_updated'
+            elif '__crdb__updated' in all_columns:
+                timestamp_col_for_check = '__crdb__updated'
+            elif 'updated' in all_columns:
+                timestamp_col_for_check = 'updated'
+            
+            # Try to detect fragmentation
+            total_rows = df.count()
+            
+            if timestamp_col_for_check and '_cdc_operation' in all_columns:
+                # Check for fragmentation at (PK + timestamp + operation) level
+                # This preserves all distinct CDC events (same key can have UPDATE + DELETE at same timestamp)
+                unique_events = df.select(primary_key_columns + [timestamp_col_for_check, '_cdc_operation']).distinct().count()
+            elif timestamp_col_for_check:
+                # Fallback: check at (PK + timestamp) level
+                unique_events = df.select(primary_key_columns + [timestamp_col_for_check]).distinct().count()
+            elif '_cdc_operation' in all_columns:
+                # Fallback: check at (PK + operation) level
+                unique_events = df.select(primary_key_columns + ['_cdc_operation']).distinct().count()
+            else:
+                # Fallback: check at PK level only
+                unique_events = df.select(primary_key_columns).distinct().count()
+            
+            if debug:
+                print(f"\n📊 Fragmentation Detection:")
+                print(f"   Total rows: {total_rows:,}")
+                if timestamp_col_for_check and '_cdc_operation' in all_columns:
+                    print(f"   Unique events (PK + timestamp + operation): {unique_events:,}")
+                elif timestamp_col_for_check:
+                    print(f"   Unique events (PK + timestamp): {unique_events:,}")
+                elif '_cdc_operation' in all_columns:
+                    print(f"   Unique events (PK + operation): {unique_events:,}")
+                else:
+                    print(f"   Unique keys (PK only): {unique_events:,}")
+                print(f"   Duplication ratio: {total_rows / unique_events if unique_events > 0 else 0:.1f}x")
+            
+            # If no duplicates, return original DataFrame
+            if total_rows == unique_events:
+                if debug:
+                    print(f"\n✅ No column family fragmentation detected")
+                    print(f"   Returning original DataFrame unchanged")
+                return df
+            
+            if debug:
+                print(f"\n🔧 Column family fragmentation detected!")
+                print(f"   Merging {total_rows:,} fragments into {unique_events:,} distinct CDC events...")
+        except Exception as e:
+            # If detection fails (e.g., actually streaming), proceed with merge
+            if debug:
+                print(f"\n⚠️  Detection failed (treating as streaming): {e}")
+                print(f"   Proceeding with merge...")
+    else:
+        if debug:
+            print(f"\n🔧 Streaming mode: Applying merge")
+            print(f"   (Cannot detect fragmentation in streaming DataFrames)")
+            print(f"   - If column families exist: fragments will be merged")
+            print(f"   - If no column families: merge is harmless no-op")
     
-    # Add metadata columns that aren't in the grouping key
-    for col in metadata_columns:
-        if col in all_columns and col not in group_by_cols:
+    # ============================================================================
+    # DEDUPLICATION MODE: Coalesce columns across time + deduplicate to latest state
+    # ============================================================================
+    if deduplicate_to_latest_state:
+        from pyspark.sql.window import Window
+        
+        if debug:
+            print(f"\n🔄 Applying cross-time coalescing + deduplication...")
+            print(f"   (Preserves latest non-NULL value per column across all events)")
+        
+        # Determine timestamp column for ordering
+        timestamp_col_for_coalesce = None
+        if '_cdc_timestamp' in all_columns:
+            timestamp_col_for_coalesce = '_cdc_timestamp'
+        elif '_cdc_updated' in all_columns:
+            timestamp_col_for_coalesce = '_cdc_updated'
+        elif '__crdb__updated' in all_columns:
+            timestamp_col_for_coalesce = '__crdb__updated'
+        elif 'updated' in all_columns:
+            timestamp_col_for_coalesce = 'updated'
+        
+        if not timestamp_col_for_coalesce:
+            if debug:
+                print(f"   ⚠️  No timestamp column found - cannot coalesce across time")
+                print(f"   Falling back to standard merge mode")
+        else:
+            # Step 1: Coalesce columns across time (keep latest non-NULL value per column)
+            if debug:
+                print(f"   Step 1: Coalescing columns by primary keys: {primary_key_columns}...")
+                print(f"           Using last_value(col, ignorenulls=True) per column")
+            
+            # Window spec: partition by PK, order by timestamp, look at all rows
+            window_spec_coalesce = (Window.partitionBy(*primary_key_columns)
+                .orderBy(F.col(timestamp_col_for_coalesce))
+                .rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing))
+            
+            # For each data column, coalesce to latest non-NULL value
+            for col in data_columns:
+                df = df.withColumn(
+                    col,
+                    F.last(F.col(col), ignorenulls=True).over(window_spec_coalesce)
+                )
+            
+            # Also coalesce _cdc_operation to the LATEST value (for DELETE handling)
+            if '_cdc_operation' in all_columns:
+                df = df.withColumn(
+                    "_cdc_operation",
+                    F.last(F.col("_cdc_operation"), ignorenulls=True).over(window_spec_coalesce)
+                )
+            
+            if debug:
+                print(f"   ✅ Columns coalesced (latest non-NULL value per column)")
+            
+            # Step 2: Deduplicate by primary key (keep LATEST row, which now has ALL coalesced columns)
+            if debug:
+                print(f"   Step 2: Deduplicating by primary keys: {primary_key_columns}...")
+            
+            window_spec_dedup = Window.partitionBy(*primary_key_columns).orderBy(F.col(timestamp_col_for_coalesce).desc())
+            df_merged = (df
+                .withColumn("_row_num", F.row_number().over(window_spec_dedup))
+                .filter(F.col("_row_num") == 1)
+                .drop("_row_num")
+            )
+            
+            if debug:
+                print(f"   ✅ Deduplication complete!")
+                print(f"      Result: Latest state per primary key with all column values preserved")
+            
+            return df_merged
+    
+    # ============================================================================
+    # STANDARD MODE: Merge fragments within events, preserve all CDC events
+    # ============================================================================
+    
+    # Build aggregation expressions for merging column family fragments
+    # CRITICAL: For CDC data, we must preserve ALL events for a key (SNAPSHOT, UPDATE, DELETE)
+    # So we group by BOTH primary_key AND timestamp to:
+    #   1. Merge fragments WITHIN the same CDC event (same PK + same timestamp)
+    #   2. Preserve ALL CDC events for a key (different timestamps)
+    agg_exprs = []
+    
+    # Determine which timestamp column to use for grouping
+    timestamp_col = None
+    if '_cdc_timestamp' in all_columns:
+        timestamp_col = '_cdc_timestamp'
+    elif '_cdc_updated' in all_columns:
+        timestamp_col = '_cdc_updated'
+    elif '__crdb__updated' in all_columns:
+        timestamp_col = '__crdb__updated'
+    elif 'updated' in all_columns:
+        timestamp_col = 'updated'
+    
+    # Determine grouping columns
+    if timestamp_col and '_cdc_operation' in all_columns:
+        # Group by PK + timestamp + operation to preserve all distinct CDC events
+        # This is critical: same key can have UPDATE and DELETE at same timestamp!
+        group_by_cols = primary_key_columns + [timestamp_col, '_cdc_operation']
+        
+        # For aggregation, use first() with ignorenulls to combine NULL values from fragments
+        # (Each fragment has data for ONE column family, other families are NULL)
+        for col in data_columns:
             agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
+        
+        # Metadata columns: also use first()
+        # Don't aggregate columns that are already in the grouping key
+        for col in metadata_columns:
+            if col in all_columns and col not in group_by_cols:
+                agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
+    elif timestamp_col:
+        # Fallback: Group by PK + timestamp only
+        group_by_cols = primary_key_columns + [timestamp_col]
+        
+        # For aggregation, use first() with ignorenulls to combine NULL values from fragments
+        # (Each fragment has data for ONE column family, other families are NULL)
+        for col in data_columns:
+            agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
+        
+        # Metadata columns: also use first()
+        # Don't aggregate columns that are already in the grouping key
+        for col in metadata_columns:
+            if col in all_columns and col not in group_by_cols:
+                agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
+    else:
+        # No timestamp column - group by PK + operation if available (best effort)
+        if '_cdc_operation' in all_columns:
+            group_by_cols = primary_key_columns + ['_cdc_operation']
+        else:
+            group_by_cols = primary_key_columns
+        
+        for col in data_columns:
+            agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
+        
+        for col in metadata_columns:
+            if col in all_columns and col not in group_by_cols:
+                agg_exprs.append(F.first(col, ignorenulls=True).alias(col))
     
-    # Apply merge
-    df_merged = df.groupBy(*group_by_cols).agg(*agg_exprs)
+    # Group by primary key + timestamp + operation and aggregate
+    if not agg_exprs:
+        # No columns to aggregate means all data is in grouping columns
+        # This shouldn't happen in normal CDC scenarios, but handle it gracefully
+        if debug:
+            print(f"\n⚠️  No additional columns to aggregate beyond grouping key")
+            print(f"   Using distinct on grouping columns: {group_by_cols}")
+        df_merged = df.select(*group_by_cols).distinct()
+    else:
+        df_merged = df.groupBy(*group_by_cols).agg(*agg_exprs)
+    
+    if debug:
+        print(f"\n✅ Merge transformation applied!")
+        if is_streaming:
+            print(f"   Streaming DataFrame merged")
+            print(f"   (Actual counts will be visible after writeStream completes)")
+        else:
+            print(f"   Batch DataFrame merged")
     
     return df_merged
 
@@ -563,7 +896,7 @@ def ingest_cdc_append_only_multi_family(
     print("🔧 Merging column family fragments...")
     print(f"   Grouping by: {primary_key_columns} + _cdc_timestamp + _cdc_operation")
     print(f"   Using first(col, ignorenulls=True) to coalesce fragments")
-    merged_df = merge_column_family_fragments(staging_df, primary_key_columns, spark)
+    merged_df = merge_column_family_fragments(staging_df, primary_key_columns)
     print("✅ Column family fragments merged")
     print()
     
@@ -712,26 +1045,23 @@ def ingest_cdc_with_merge_multi_family(
         print("   ℹ️  No new events to process")
         return {"query": query, "staging_table": staging_table_fqn, "merged": 0}
     
-    # Merge column family fragments (batch mode - no streaming limitations!)
-    print(f"   🔧 Merging column family fragments...")
-    print(f"      Grouping by: {primary_key_columns} + _cdc_timestamp + _cdc_operation")
-    staging_df_merged = merge_column_family_fragments(staging_df_raw, primary_key_columns, spark)
-    print(f"   ✅ Column family fragments merged")
+    # Merge column family fragments WITH NULL coalescing (batch mode)
+    # CRITICAL: Use deduplicate_to_latest_state=True to preserve column values
+    # across fragments and time (fixes the NULL bug for column families)
+    print(f"   🔧 Merging column family fragments with NULL coalescing...")
+    print(f"      Mode: deduplicate_to_latest_state=True")
+    print(f"      This preserves latest non-NULL value per column across all events")
     
-    # Deduplicate by primary key (keep latest event)
-    print(f"   🔄 Deduplicating by primary keys: {primary_key_columns}...")
-    window_spec = Window.partitionBy(*primary_key_columns).orderBy(F.col("_cdc_timestamp").desc())
-    staging_df = (staging_df_merged
-        .withColumn("_row_num", F.row_number().over(window_spec))
-        .filter(F.col("_row_num") == 1)
-        .drop("_row_num")
+    staging_df = merge_column_family_fragments(
+        staging_df_raw, 
+        primary_key_columns,
+        deduplicate_to_latest_state=True,  # ← CRITICAL FIX for column family NULLs
+        debug=True  # Show merge statistics
     )
     
     staging_count = staging_df.count()
-    fragments_removed = staging_count_raw - staging_df_merged.count()
-    duplicates_removed = staging_df_merged.count() - staging_count
-    print(f"   ✅ Column family fragments coalesced: {fragments_removed} fragments merged")
-    print(f"   ✅ Deduplicated: {staging_count} unique events ({duplicates_removed} duplicates removed)")
+    fragments_removed = staging_count_raw - staging_count
+    print(f"   ✅ Merged and deduplicated: {staging_count} unique keys ({fragments_removed} fragments/duplicates removed)")
     
     if staging_count == 0:
         print("   ℹ️  All events were duplicates")
