@@ -1045,23 +1045,39 @@ def ingest_cdc_with_merge_multi_family(
         print("   ℹ️  No new events to process")
         return {"query": query, "staging_table": staging_table_fqn, "merged": 0}
     
-    # Merge column family fragments WITH NULL coalescing (batch mode)
-    # CRITICAL: Use deduplicate_to_latest_state=True to preserve column values
-    # across fragments and time (fixes the NULL bug for column families)
-    print(f"   🔧 Merging column family fragments with NULL coalescing...")
-    print(f"      Mode: deduplicate_to_latest_state=True")
-    print(f"      This preserves latest non-NULL value per column across all events")
+    # Merge column family fragments (batch mode)
+    # For SCD Type 1 (update_delete mode): Keep LATEST STATE exactly as-is (including NULLs)
+    # - Step 1: Merge fragments WITHIN same CDC event (same timestamp)
+    # - Step 2: Deduplicate to keep LATEST row per key (latest state, even if NULL)
+    print(f"   🔧 Merging column family fragments (SCD Type 1 mode)...")
+    print(f"      Step 1: Merge fragments within same CDC event")
+    print(f"      Step 2: Deduplicate to keep latest state per key (including NULLs)")
     
-    staging_df = merge_column_family_fragments(
+    # Step 1: Merge fragments within same timestamp (standard mode)
+    staging_df_merged = merge_column_family_fragments(
         staging_df_raw, 
         primary_key_columns,
-        deduplicate_to_latest_state=True,  # ← CRITICAL FIX for column family NULLs
+        deduplicate_to_latest_state=False,  # Standard merge, no cross-time coalescing
         debug=True  # Show merge statistics
     )
     
+    # Step 2: Deduplicate by primary key - keep LATEST row (even if it has NULLs)
+    # This gives us the current state for SCD Type 1
+    from pyspark.sql.window import Window
+    print(f"   🔄 Deduplicating by primary keys: {primary_key_columns}...")
+    window_spec = Window.partitionBy(*primary_key_columns).orderBy(F.col("_cdc_timestamp").desc())
+    staging_df = (staging_df_merged
+        .withColumn("_row_num", F.row_number().over(window_spec))
+        .filter(F.col("_row_num") == 1)
+        .drop("_row_num")
+    )
+    
     staging_count = staging_df.count()
-    fragments_removed = staging_count_raw - staging_count
-    print(f"   ✅ Merged and deduplicated: {staging_count} unique keys ({fragments_removed} fragments/duplicates removed)")
+    fragments_merged = staging_count_raw - staging_df_merged.count()
+    duplicates_removed = staging_df_merged.count() - staging_count
+    print(f"   ✅ Fragments merged: {fragments_merged}")
+    print(f"   ✅ Deduplicated: {staging_count} unique keys ({duplicates_removed} duplicates removed)")
+    print(f"   💡 Latest state per key retained (including NULLs for SCD Type 1)")
     
     if staging_count == 0:
         print("   ℹ️  All events were duplicates")
