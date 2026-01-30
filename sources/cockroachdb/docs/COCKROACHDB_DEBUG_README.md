@@ -244,7 +244,7 @@ inspect_raw_cdc_files(
 
 ---
 
-### 6. `diagnose_column_family_sync(conn, source_table, target_df, primary_keys, mismatched_columns)`
+### 6. `diagnose_column_family_sync(conn, source_table, target_df, primary_keys, mismatched_columns, cdc_mode)`
 
 **Purpose:** Comprehensive diagnosis of column family sync issues
 
@@ -254,6 +254,7 @@ inspect_raw_cdc_files(
 - `target_df`: Target Spark DataFrame
 - `primary_keys`: List of primary key columns
 - `mismatched_columns`: Columns with sum mismatches (from Cell 14 output)
+- `cdc_mode`: CDC mode ('append_only' or 'update_delete') - default: 'append_only'
 
 **Example:**
 ```python
@@ -262,13 +263,18 @@ diagnose_column_family_sync(
     source_table="defaultdb.public.usertable_update_delete_multi_cf",
     target_df=target_df,
     primary_keys=['ycsb_key'],
-    mismatched_columns=['field3', 'field4', 'field5', 'field6', 'field7', 'field8', 'field9']
+    mismatched_columns=['field3', 'field4', 'field5', 'field6', 'field7', 'field8', 'field9'],
+    cdc_mode='update_delete'
 )
 ```
 
 **Output:**
 ```
-1️⃣  Column Family Assignments:
+1️⃣  Column Family Assignments & Sync Status:
+
+  Legend:
+     ✅ = Column syncing correctly
+     ❌ = Column has sync issues (mismatched values)
 
   📁 Family 'pk':
      ✅ ycsb_key
@@ -288,7 +294,23 @@ diagnose_column_family_sync(
      ❌ field9
 
 2️⃣  Sample Row Comparison:
-[Shows specific row-by-row comparisons]
+================================================================================
+ROW-BY-ROW COMPARISON (Source → Target)
+================================================================================
+
+📝 Mode: UPDATE_DELETE
+   Comparing source against target (should be 1:1 match)
+
+Checks that all source rows exist in target with correct values.
+
+✅ Key (ycsb_key=0): All columns match
+🚨 Key (ycsb_key=1): Row missing in TARGET
+     This is a data loss issue - source row not replicated to target
+✅ Key (ycsb_key=2): All columns match
+
+Note: In APPEND_ONLY mode, the comparison is against the LATEST target row
+      (ordered by _cdc_timestamp or __crdb__updated), since multiple versions
+      of the same key exist in the append-only log.
 
 3️⃣  Mismatch Pattern Analysis:
   Analyzing 7 mismatched columns...

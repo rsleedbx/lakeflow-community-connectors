@@ -94,23 +94,60 @@ def get_table_stats(conn, table_name: str) -> Dict[str, Any]:
     Get min key, max key, and count for a table.
     
     Args:
-        conn: Database connection
+        conn: Database connection (pg8000.native.Connection)
         table_name: Name of the table
     
     Returns:
         dict with 'min_key', 'max_key', 'count', 'is_empty'
     """
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT MIN(ycsb_key), MAX(ycsb_key), COUNT(*) FROM {table_name}")
-        result = cur.fetchone()
-        min_key, max_key, count = result
-        
-        return {
-            'min_key': min_key,
-            'max_key': max_key,
-            'count': count,
-            'is_empty': min_key is None and max_key is None
-        }
+    # pg8000.native uses conn.run() directly (no cursor needed)
+    result = conn.run(f"SELECT MIN(ycsb_key), MAX(ycsb_key), COUNT(*) FROM {table_name}")
+    min_key, max_key, count = result[0]
+    
+    return {
+        'min_key': min_key,
+        'max_key': max_key,
+        'count': count,
+        'is_empty': min_key is None and max_key is None
+    }
+
+
+def get_table_stats_spark(spark, table_fqn: str) -> Dict[str, Any]:
+    """
+    Get min key, max key, and count for a Spark table.
+    
+    Args:
+        spark: SparkSession
+        table_fqn: Fully qualified table name (catalog.schema.table)
+    
+    Returns:
+        dict with 'min_key', 'max_key', 'count', 'is_empty'
+    
+    Example:
+        # Get stats from Databricks Delta table
+        target_stats = get_table_stats_spark(
+            spark, 
+            'main.robert_lee_cockroachdb.usertable_update_delete_multi_cf'
+        )
+        print(f"Target has {target_stats['count']} rows")
+    """
+    from pyspark.sql import functions as F
+    
+    target_df = spark.read.table(table_fqn)
+    
+    # Calculate stats using Spark aggregation
+    stats_df = target_df.agg(
+        F.min("ycsb_key").alias("min_key"),
+        F.max("ycsb_key").alias("max_key"),
+        F.count("*").alias("count")
+    ).collect()[0]
+    
+    return {
+        'min_key': stats_df['min_key'],
+        'max_key': stats_df['max_key'],
+        'count': stats_df['count'],
+        'is_empty': stats_df['min_key'] is None and stats_df['max_key'] is None
+    }
 
 
 def get_column_sum(conn, table_name: str, column_name: str) -> int:
@@ -119,7 +156,7 @@ def get_column_sum(conn, table_name: str, column_name: str) -> int:
     Text columns have non-numeric characters stripped before casting.
     
     Args:
-        conn: Database connection (pg8000)
+        conn: Database connection (pg8000.native.Connection)
         table_name: Name of the table
         column_name: Name of the column to sum
     
@@ -130,19 +167,81 @@ def get_column_sum(conn, table_name: str, column_name: str) -> int:
         # Sum a text column with mixed values like 'updated_at_1234567890'
         total = get_column_sum(conn, 'usertable_update_delete_multi_cf', 'field0')
     """
-    with conn.cursor() as cur:
-        # Strip non-numeric chars, handle empty strings, cast to BIGINT
-        cur.execute(f"""
-            SELECT SUM(
-                CASE 
-                    WHEN regexp_replace({column_name}::TEXT, '[^0-9]', '', 'g') = '' THEN 0
-                    ELSE regexp_replace({column_name}::TEXT, '[^0-9]', '', 'g')::BIGINT
-                END
-            ) 
-            FROM {table_name}
-        """)
-        result = cur.fetchone()
-        return result[0] if result[0] is not None else 0
+    # pg8000.native uses conn.run() directly (no cursor needed)
+    # Strip non-numeric chars, handle empty strings, cast to BIGINT
+    result = conn.run(f"""
+        SELECT SUM(
+            CASE 
+                WHEN regexp_replace({column_name}::TEXT, '[^0-9]', '', 'g') = '' THEN 0
+                ELSE regexp_replace({column_name}::TEXT, '[^0-9]', '', 'g')::BIGINT
+            END
+        ) 
+        FROM {table_name}
+    """)
+    return result[0][0] if result and result[0][0] is not None else 0
+
+
+def deduplicate_to_latest(
+    df,
+    primary_keys: List[str],
+    timestamp_col: str = None,
+    verbose: bool = False
+):
+    """
+    Deduplicate a Spark DataFrame to keep only the latest row per primary key.
+    
+    This is essential for APPEND_ONLY mode where the target contains all CDC events
+    (multiple versions of the same key). After deduplication, you get the current
+    state equivalent to the source table.
+    
+    Args:
+        df: Spark DataFrame to deduplicate
+        primary_keys: List of primary key column names
+        timestamp_col: Timestamp column name for ordering. If None, auto-detects
+                      (_cdc_timestamp or __crdb__updated)
+        verbose: Print deduplication progress messages
+    
+    Returns:
+        Deduplicated Spark DataFrame with latest row per key
+    
+    Example:
+        # For append_only mode comparison
+        target_df = spark.read.table("catalog.schema.table")
+        target_df_latest = deduplicate_to_latest(
+            target_df, 
+            primary_keys=['ycsb_key'],
+            verbose=True
+        )
+        # Now target_df_latest has 1 row per key (latest state)
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+    
+    # Auto-detect timestamp column if not provided
+    if timestamp_col is None:
+        if '_cdc_timestamp' in df.columns:
+            timestamp_col = '_cdc_timestamp'
+        elif '__crdb__updated' in df.columns:
+            timestamp_col = '__crdb__updated'
+        else:
+            raise ValueError("No timestamp column found. Provide timestamp_col explicitly or ensure DataFrame has _cdc_timestamp or __crdb__updated")
+    
+    if verbose:
+        original_count = df.count()
+        print(f"   Deduplicating using {timestamp_col} (keeping latest row per key)...")
+    
+    # Create window spec: partition by primary keys, order by timestamp descending
+    window_spec = Window.partitionBy(*primary_keys).orderBy(F.col(timestamp_col).desc())
+    
+    # Add row number and keep only the first row (latest) for each key
+    df_with_rank = df.withColumn("_row_num", F.row_number().over(window_spec))
+    df_deduplicated = df_with_rank.filter(F.col("_row_num") == 1).drop("_row_num")
+    
+    if verbose:
+        deduplicated_count = df_deduplicated.count()
+        print(f"   ✅ Deduplicated: {original_count} rows → {deduplicated_count} rows (latest per key)")
+    
+    return df_deduplicated
 
 
 def get_column_sum_spark(df, column_name: str) -> int:
@@ -176,6 +275,53 @@ def get_column_sum_spark(df, column_name: str) -> int:
     ).collect()[0]['sum']
     
     return result if result is not None else 0
+
+
+def get_column_sum_spark_deduplicated(
+    df,
+    column_name: str,
+    primary_keys: List[str],
+    timestamp_col: str = None,
+    verbose: bool = False
+) -> int:
+    """
+    Get the sum of a numeric column after deduplicating to latest row per key.
+    
+    This is the correct way to compare append_only target tables with source tables:
+    1. Deduplicate target to latest state per key
+    2. Calculate sum from deduplicated data
+    
+    Args:
+        df: Spark DataFrame (possibly with duplicate keys in append_only mode)
+        column_name: Name of the column to sum
+        primary_keys: List of primary key column names
+        timestamp_col: Timestamp column for ordering (auto-detected if None)
+        verbose: Print deduplication progress messages
+    
+    Returns:
+        Sum of the column after deduplication
+    
+    Example:
+        # For append_only mode verification (Cell 14)
+        target_df = spark.read.table("catalog.schema.table")
+        
+        # Compare source vs target (deduplicated)
+        source_sum = get_column_sum(conn, source_table, 'field0')
+        target_sum = get_column_sum_spark_deduplicated(
+            target_df, 
+            'field0',
+            primary_keys=['ycsb_key'],
+            verbose=True
+        )
+        
+        if source_sum == target_sum:
+            print("✅ Sums match!")
+    """
+    # Deduplicate first
+    df_deduplicated = deduplicate_to_latest(df, primary_keys, timestamp_col, verbose)
+    
+    # Then calculate sum
+    return get_column_sum_spark(df_deduplicated, column_name)
 
 
 def insert_ycsb_snapshot(

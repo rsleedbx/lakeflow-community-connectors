@@ -966,7 +966,7 @@ def ingest_cdc_with_merge_multi_family(
     from delta.tables import DeltaTable
     
     # Build paths
-    source_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/parquet/{source_catalog}/{source_schema}/{source_table}/{target_table}"
+    source_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/parquet/{source_catalog}/{source_schema}/{source_table}"
     checkpoint_path = f"/checkpoints/{target_schema}_{target_table}_merge_cf"
     target_table_fqn = f"{target_catalog}.{target_schema}.{target_table}"
     
